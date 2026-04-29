@@ -73,11 +73,11 @@ node_modules/
 admin/.next/
 admin/out/
 
-# Generated GTFS artifacts (regenerables, demasiado grandes)
+# Generated GTFS artifacts (regenerables, demasiado grandes para repo)
 gtfs/
 gtfs.zip
-stop-schedules.json
-functions/stop-schedules.json
+# stop-schedules.json INCLUIDO en repo (24MB) — index.js hace
+# readFileSync de éste al módulo load. Sin él, deploy falla.
 
 # macOS
 .DS_Store
