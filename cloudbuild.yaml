@@ -1,0 +1,57 @@
+# Cloud Build pipeline para mvd-proxy:
+# 1. Install deps en functions/ y admin/
+# 2. Tests Jest backend
+# 3. Build admin Next.js (static export)
+# 4. Deploy Cloud Functions + Firestore rules + indexes + admin hosting
+
+steps:
+  # ── Install dependencies ────────────────────────────────
+  - id: install-functions
+    name: 'node:24'
+    entrypoint: 'npm'
+    dir: 'functions'
+    args: ['ci']
+
+  - id: install-admin
+    name: 'node:20'
+    entrypoint: 'npm'
+    dir: 'admin'
+    args: ['ci']
+    waitFor: ['-']
+
+  # ── Tests backend ───────────────────────────────────────
+  - id: test-functions
+    name: 'node:24'
+    entrypoint: 'npx'
+    dir: 'functions'
+    args: ['jest', '--silent', '--bail']
+    waitFor: ['install-functions']
+
+  # ── Build admin Next.js (static export) ────────────────
+  - id: build-admin
+    name: 'node:20'
+    entrypoint: 'npm'
+    dir: 'admin'
+    args: ['run', 'build']
+    waitFor: ['install-admin']
+
+  # ── Deploy Firebase (functions + rules + indexes + hosting) ─
+  - id: deploy
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        npm install -g firebase-tools && \
+        firebase deploy \
+          --only functions,firestore:rules,firestore:indexes,storage:rules,hosting \
+          --project vamo-dbad6 \
+          --force \
+          --non-interactive
+    waitFor: ['test-functions', 'build-admin']
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
+timeout: '1800s'
