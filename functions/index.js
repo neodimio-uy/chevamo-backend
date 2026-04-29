@@ -3161,10 +3161,43 @@ exports.runStaticGtfsPipeline = onRequest(
       const gzipped = zlib.gzipSync(Buffer.from(json, "utf8"), { level: 9 });
       const sizeMb = (gzipped.length / 1024 / 1024).toFixed(2);
 
+      // Path con date EN LA TZ DE LA CIUDAD (no UTC). Si Lisboa procesa a
+      // las 02:30 local del 29-abril (= 01:30 UTC del 29-abril), el snapshot
+      // queda en `gtfs-snapshots/cm-lisboa-static/2026-04-29/...`. Para Mvd
+      // procesado a 02:30 UY (= 05:30 UTC), también `2026-04-29`. Cada feed
+      // tiene "su" día.
+      const feedTz = require("./lib/feed-timezones");
+      const local = feedTz.localTimeForFeed(feedId) || {
+        dateLocal: new Date().toISOString().slice(0, 10),
+        tz:        "UTC",
+      };
+      const dateLocal = local.dateLocal;             // "2026-04-29"
+      const datePath  = dateLocal.replace(/-/g, ""); // "20260429"
+
       const bucket = admin.storage().bucket(); // bucket default vamo-dbad6.firebasestorage.app
-      const today = new Date().toISOString().slice(0, 10).replace(/-/g, ""); // YYYYMMDD
       const latestPath = `gtfs-snapshots/${feedId}/latest/snapshot.json.gz`;
-      const datedPath  = `gtfs-snapshots/${feedId}/${today}/snapshot.json.gz`;
+      const datedPath  = `gtfs-snapshots/${feedId}/${datePath}/snapshot.json.gz`;
+      const metaPath   = `gtfs-snapshots/${feedId}/${datePath}/meta.json`;
+      const latestMeta = `gtfs-snapshots/${feedId}/latest/meta.json`;
+
+      const fetchedAtUtc = new Date().toISOString();
+      const meta = {
+        feedId,
+        sourceUrl:         feedConfig.sourceUrl,
+        license:           feedConfig.license,
+        cityIds:           feedConfig.cityIds,
+        cityTimezone:      local.tz,
+        snapshotDateLocal: dateLocal,
+        fetchedAtUtc,
+        // ISO-8601 con offset de la TZ de la ciudad (legible para auditoría).
+        fetchedAtLocal:    new Date(fetchedAtUtc).toLocaleString("sv-SE", {
+          timeZone: local.tz, hour12: false,
+        }).replace(" ", "T") + " (" + local.tz + ")",
+        durationMs,
+        snapshotSizeBytes: gzipped.length,
+        counts:            snapshot.counts,
+        strongCascade,
+      };
 
       const writeOpts = {
         contentType:        "application/json",
@@ -3172,14 +3205,23 @@ exports.runStaticGtfsPipeline = onRequest(
         cacheControl:       "public, max-age=3600",
         metadata: {
           feedId,
-          strongCascade: String(strongCascade),
-          generatedAt:   snapshot.generatedAt,
-          counts:        JSON.stringify(snapshot.counts),
+          strongCascade:     String(strongCascade),
+          generatedAt:       snapshot.generatedAt,
+          cityTimezone:      local.tz,
+          snapshotDateLocal: dateLocal,
+          counts:            JSON.stringify(snapshot.counts),
         },
       };
+      const metaWriteOpts = {
+        contentType:  "application/json",
+        cacheControl: "public, max-age=300", // meta cambia cada noche, TTL corto
+      };
+      const metaJson = JSON.stringify(meta, null, 2);
 
-      await bucket.file(latestPath).save(gzipped, { metadata: writeOpts, resumable: false });
-      await bucket.file(datedPath).save(gzipped,  { metadata: writeOpts, resumable: false });
+      await bucket.file(latestPath).save(gzipped,           { metadata: writeOpts, resumable: false });
+      await bucket.file(datedPath).save(gzipped,            { metadata: writeOpts, resumable: false });
+      await bucket.file(metaPath).save(metaJson,            { metadata: metaWriteOpts, resumable: false });
+      await bucket.file(latestMeta).save(metaJson,          { metadata: metaWriteOpts, resumable: false });
 
       // Hacer público el snapshot para que el cliente iOS los descargue
       // sin auth desde `https://storage.googleapis.com/<bucket>/<path>`. Los
@@ -3187,6 +3229,8 @@ exports.runStaticGtfsPipeline = onRequest(
       try {
         await bucket.file(latestPath).makePublic();
         await bucket.file(datedPath).makePublic();
+        await bucket.file(metaPath).makePublic();
+        await bucket.file(latestMeta).makePublic();
       } catch (e) {
         logger.warn(`runStaticGtfsPipeline ${feedId} makePublic warning: ${e.message}`);
       }
@@ -3271,5 +3315,119 @@ exports.onAsyncWrite = onMessagePublished(
       logger.error(`onAsyncWrite ${kind} error: ${e.message}`);
       throw e;
     }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────
+// Track D — Nightly GTFS batch (orquestador)
+// ─────────────────────────────────────────────────────────────────
+//
+// Diseño:
+//   - Corre cada hora (UTC).
+//   - Para cada feed estático en STATIC_FEEDS:
+//       * Resuelve TZ de la ciudad (Mvd → America/Montevideo, Lisboa → Europe/Lisbon, etc.)
+//       * Si hora local en [02:00, 03:59] → procesa este feed
+//       * Idempotencia: chequea Firestore `gtfs_runs/{feedId}__{dateLocal}`
+//         (donde dateLocal = "YYYY-MM-DD" en TZ de la ciudad). Si ya corrió, skip.
+//   - Invoca `runStaticGtfsPipeline` (us-central1) via HTTP firmado.
+//
+// El orquestador vive en sa-east1 (default global region) pero el pipeline
+// vive en us-central1 (depende del bucket us-central1). Cross-region call
+// del orquestador al pipeline es OK: trivial overhead (~125ms una vez por feed/noche).
+//
+// Schedule: cada hora — la ventana es 2h (02:00-03:59 local), entonces hay 2
+// chances de disparo. Idempotencia evita doble-corrida.
+
+exports.nightlyGtfsBatch = onSchedule(
+  {
+    schedule:       "every 1 hours",
+    timeZone:       "UTC",
+    memory:         "256MiB",
+    timeoutSeconds: 540,    // permite procesar varios feeds en serie con margen
+  },
+  async () => {
+    const feedTz = require("./lib/feed-timezones");
+    const feeds = staticFeeds.STATIC_FEEDS;
+
+    logger.info(`nightlyGtfsBatch: evaluando ${feeds.length} feeds`);
+
+    const now = new Date();
+    let processed = 0, skipped = 0, failed = 0;
+
+    for (const feed of feeds) {
+      const feedId = feed.feedId;
+      const local = feedTz.localTimeForFeed(feedId, now);
+
+      if (!local) {
+        logger.warn(`nightlyGtfsBatch: ${feedId} sin TZ resoluble — skip`);
+        continue;
+      }
+
+      // Ventana 02:00-03:59 local
+      const inWindow = local.hour >= 2 && local.hour < 4;
+      if (!inWindow) {
+        skipped += 1;
+        continue;
+      }
+
+      // Idempotencia: ¿ya corrió hoy (dateLocal de la ciudad)?
+      const runId = `${feedId}__${local.dateLocal}`;
+      const runDocRef = db.collection("gtfs_runs").doc(runId);
+      const runDoc = await runDocRef.get();
+      if (runDoc.exists && runDoc.data().status === "ok") {
+        logger.info(`nightlyGtfsBatch: ${feedId} ya procesado para ${local.dateLocal} (${local.tz}) — skip`);
+        skipped += 1;
+        continue;
+      }
+
+      // Marcar in-progress
+      await runDocRef.set({
+        feedId,
+        cityTimezone: local.tz,
+        dateLocal:    local.dateLocal,
+        startedAtUtc: new Date().toISOString(),
+        status:       "running",
+      }, { merge: true });
+
+      // Invocar pipeline en us-central1 con OIDC token (la function tiene
+      // invoker:private, requiere IAM auth)
+      const pipelineUrl = `https://runstaticgtfspipeline-uz7smrj4ua-uc.a.run.app?feedId=${encodeURIComponent(feedId)}`;
+      try {
+        const { GoogleAuth } = require("google-auth-library");
+        const auth = new GoogleAuth();
+        const client = await auth.getIdTokenClient(pipelineUrl);
+        const tStart = Date.now();
+        const r = await client.request({
+          url:    pipelineUrl,
+          method: "GET",
+          timeout: 540_000,
+        });
+        const durationMs = Date.now() - tStart;
+
+        if (r.data && r.data.ok) {
+          await runDocRef.set({
+            status:        "ok",
+            finishedAtUtc: new Date().toISOString(),
+            durationMs,
+            counts:        r.data.data?.counts || null,
+            sizeBytes:     r.data.data?.snapshotSizeBytes || null,
+          }, { merge: true });
+          processed += 1;
+          logger.info(`nightlyGtfsBatch: ${feedId} OK en ${durationMs}ms (${local.dateLocal} ${local.tz})`);
+        } else {
+          throw new Error(`Pipeline returned non-ok: ${JSON.stringify(r.data).slice(0, 200)}`);
+        }
+      } catch (e) {
+        await runDocRef.set({
+          status:        "failed",
+          finishedAtUtc: new Date().toISOString(),
+          error:         (e.message || String(e)).slice(0, 500),
+        }, { merge: true });
+        failed += 1;
+        logger.error(`nightlyGtfsBatch: ${feedId} FAILED — ${e.message}`);
+      }
+    }
+
+    logger.info(`nightlyGtfsBatch: done — processed=${processed} skipped=${skipped} failed=${failed}`);
   }
 );
