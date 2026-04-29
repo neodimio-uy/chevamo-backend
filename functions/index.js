@@ -6,10 +6,18 @@ const { setGlobalOptions, params } = require("firebase-functions/v2");
 const defineSecret = params.defineSecret;
 const { logger } = require("firebase-functions");
 // Cloud Profiler — perfilado continuo low-overhead (CPU + heap) en producción.
-// Debe iniciar ANTES que cualquier require pesado para que vea todo.
-require("@google-cloud/profiler").start({
-  serviceContext: { service: "vamo-api", version: process.env.K_REVISION || "local" },
-}).catch(() => { /* no bloquear si profiler falla */ });
+// Solo en runtime de Cloud Run (K_REVISION presente). Durante `firebase deploy`
+// el analyzer corre el index.js sin K_REVISION → pprof bindings nativos
+// pueden no estar disponibles → MODULE_NOT_FOUND. Try/catch protege.
+if (process.env.K_REVISION) {
+  try {
+    require("@google-cloud/profiler").start({
+      serviceContext: { service: "vamo-api", version: process.env.K_REVISION },
+    }).catch(() => { /* no bloquear si profiler falla */ });
+  } catch (e) {
+    // Profiler no disponible (build env, missing native bindings) — ignorar.
+  }
+}
 
 const axios = require("axios");
 const http = require("http");
