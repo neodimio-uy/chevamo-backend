@@ -84,6 +84,18 @@ const STATIC_FEEDS = [
     notes:               "GTFS estático SBASE: 9 routes (A/B/C/D/E/H + Premetro), 707 stops, pathways, transfers, fares. Vigente hasta 2026-12-31. ZIP ~48KB (snapshot final esperado <100KB gzip).",
   },
   {
+    feedId:              "imm-stm-static",
+    cityIds:             ["uy.mvd-area-metro"],
+    // GTFS oficial IMM Mvd urbano (STM-MVD). URL pública oficial pendiente con
+    // IMM (`pci@imm.gub.uy`). Mientras tanto re-hosting en GCS público del
+    // proyecto vamo-dbad6 — el ZIP se actualiza al recibir nuevo feed de IMM.
+    sourceUrl:           "https://storage.googleapis.com/vamo-dbad6.firebasestorage.app/gtfs-source/imm-stm.zip",
+    bbox:                { swLat: -34.95, swLng: -56.50, neLat: -34.40, neLng: -55.80 },
+    refreshIntervalDays: 30,
+    license:             "IMM Montevideo — uso público (pci@imm.gub.uy)",
+    notes:               "GTFS oficial Sistema de Transporte Metropolitano IMM. Versión 20260330, vigente 2026-03-30 a 2026-04-30. ~3.5k paradas + ~600 shapes + stop_times.txt 85MB. Re-hosting en GCS hasta tener URL pública oficial IMM.",
+  },
+  {
     feedId:              "mtop-suburban-static",
     cityIds:             ["uy.mvd-area-metro", "uy.long-distance"],
     sourceUrl:           "https://catalogodatos.gub.uy/dataset/1d50ccf7-121d-48a7-951e-28a02858d24e/resource/9f44b654-751a-42a4-a481-af91b7c9a2e4/download",
@@ -140,11 +152,6 @@ const STATIC_FEEDS = [
   // Pendientes de validar URL pública (placeholders activables — comentados
   // hasta confirmar). Cuando se confirmen, mover fuera del bloque comentado.
   // ─────────────────────────────────────────────────────────────────────
-  //
-  // imm-stm-static (Mvd urbano): GTFS local en /Users/ignacio/mvd-proxy/gtfs/
-  // desde 2026-04-05. URL pública pendiente con IMM.
-  //   sourceUrl: "https://... (pendiente)"
-  //   bbox:      { swLat: -34.95, swLng: -56.50, neLat: -34.40, neLng: -55.80 }
   //
   // mtop-suburban-static (UY suburbano): GTFS oficial MTOP cubre Mvd+Canelones+SJ.
   // 7,190 paradas + 368 shapes confirmados (2026-04-22, ver project_vamo_mtop_suburban_data.md).
