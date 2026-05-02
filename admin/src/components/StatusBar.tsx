@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import ThemeToggle from "./ThemeToggle";
 import NotificationBell from "./NotificationBell";
 import PresenceIndicator from "./PresenceIndicator";
+import CitySelector from "./CitySelector";
 import { SearchIcon } from "./icons";
 
 const STATUS_DOT: Record<HealthStatus, string> = {
@@ -77,6 +78,11 @@ export default function StatusBar({
           <span className="text-text-muted">/</span>
           <span className="font-semibold tracking-tight text-text">{label}</span>
         </div>
+
+        <div className="h-4 w-px bg-border mx-1" />
+
+        {/* Selector de ciudad / modo (multi-tenant del dashboard) */}
+        <CitySelector />
 
         <div className="h-4 w-px bg-border mx-1" />
 

@@ -3104,10 +3104,11 @@ exports.runStaticGtfsPipeline = onRequest(
   {
     region:         "us-central1",
     memory:         "16GiB",          // TransMilenio: 156MB zip → 1GB extracted + 500MB JSON + gzip buffers
-    timeoutSeconds: 540,
+    timeoutSeconds: 1800,             // bumpeado 2026-04-30: stopsByRoute parsea stop_times.txt entero (CABA: ~13M filas + ~2-3 min extra). Ceiling Gen2 = 3600s.
     cpu:            4,                // CPUs adicionales aceleran parse de stop_times grandes
     cors:           false,            // admin-only, no se llama desde browser cliente
     invoker:        "private",        // bloquea allUsers; IAM enforced al deployar
+    secrets:        [baTransportClientId, baTransportClientSecret], // inyectados a feeds GCBA con `requiresAuth: "BA_TRANSPORT"`
   },
   async (req, res) => {
     if (req.method !== "GET" && req.method !== "POST") {
@@ -3130,9 +3131,37 @@ exports.runStaticGtfsPipeline = onRequest(
       return fail(res, "INVALID_REQUEST", "Falta query param 'feedId'");
     }
 
-    const feedConfig = staticFeeds.getStaticFeed(feedId);
+    let feedConfig = staticFeeds.getStaticFeed(feedId);
     if (!feedConfig) {
       return fail(res, "INVALID_REQUEST", `feedId desconocido: ${feedId}`);
+    }
+
+    // Inyección de credenciales para feeds protegidos por la API gateway
+    // de GCBA (`gcba-subte-static`, futuros `gcba-trenes-static`, etc.).
+    // El feed config trae `requiresAuth: "BA_TRANSPORT"` y la sourceUrl
+    // base; acá la mutamos para agregar `?client_id=X&client_secret=Y`
+    // antes de pasarla al pipeline (que hace axios.get directo).
+    if (feedConfig.requiresAuth === "BA_TRANSPORT") {
+      // `.trim()` por si los secrets se crearon con un trailing newline (caso
+      // típico al pegar valores con `gcloud secrets create --data-file=...`).
+      // Sin trim, el `\n` se manda al upstream y el proxy GCBA rechaza con 401.
+      const cid  = (baTransportClientId.value() || "").trim();
+      const csec = (baTransportClientSecret.value() || "").trim();
+      if (!cid || !csec) {
+        logger.error(`runStaticGtfsPipeline ${feedId}: BA_TRANSPORT secrets no configurados`);
+        return fail(res, "MISCONFIGURED", "BA_TRANSPORT credentials missing");
+      }
+      const sep = feedConfig.sourceUrl.includes("?") ? "&" : "?";
+      // SIN `encodeURIComponent` — el proxy GCBA Mulesoft espera los valores
+      // crudos (validado: el curl directo `?client_id=$CID&client_secret=$CSEC`
+      // sin encode devuelve 200, mientras que con encode sobre algunos chars
+      // base64 (`+`, `/`, `=`) el upstream rechaza con 401.
+      // `fetchUrl` se usa solo para el axios.get del pipeline. `sourceUrl`
+      // queda intacta para no exponer credenciales en meta.json / snapshot.json.
+      feedConfig = {
+        ...feedConfig,
+        fetchUrl: `${feedConfig.sourceUrl}${sep}client_id=${cid}&client_secret=${csec}`,
+      };
     }
 
     logger.info(`runStaticGtfsPipeline: ${feedId} arrancando (strongCascade=${strongCascade})`);

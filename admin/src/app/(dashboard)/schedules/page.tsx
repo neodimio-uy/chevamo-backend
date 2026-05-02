@@ -2,9 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { getBusStops, getSchedules } from "@/lib/api";
+import { useCity } from "@/lib/cityContext";
 import type { BusStop } from "@/lib/types";
 
 export default function SchedulesPage() {
+  const { city, mode } = useCity();
+  const isMvdLegacy = city.legacyMvdEndpoint;
+
   const [stops, setStops] = useState<BusStop[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -13,10 +17,36 @@ export default function SchedulesPage() {
   const [schedulesLoading, setSchedulesLoading] = useState(false);
 
   useEffect(() => {
+    if (!isMvdLegacy) {
+      setStops([]);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     getBusStops()
       .then(setStops)
       .finally(() => setLoading(false));
-  }, []);
+  }, [isMvdLegacy]);
+
+  // CABA: horarios programados no disponibles (snapshot no incluye stop_times
+  // por tamaño). Mostrar mensaje y dirigir al mapa para arribos en vivo.
+  if (!isMvdLegacy) {
+    return (
+      <div>
+        <div className="mb-8">
+          <h1 className="text-2xl font-bold text-text">Horarios · {city.shortName} · {mode.label}</h1>
+        </div>
+        <div className="rounded-2xl border border-dashed border-border bg-bg-card p-8 text-center">
+          <p className="text-sm font-semibold text-text">Horarios estáticos no disponibles</p>
+          <p className="mt-2 text-sm text-text-secondary max-w-md mx-auto">
+            El GTFS estático de {city.shortName} no incluye <code className="font-mono">stop_times</code> por tamaño
+            (~700MB descomprimido). Para próximos arribos en vivo, andá al{" "}
+            <a href="/map" className="text-primary underline">Mapa</a> y tap una parada/estación.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   useEffect(() => {
     if (!selectedStop) {
@@ -33,8 +63,9 @@ export default function SchedulesPage() {
   const filtered = search.trim()
     ? stops.filter((s) => {
         const q = search.toLowerCase();
+        const idStr = String(s?.id ?? "");
         return (
-          s.id.toString().includes(q) ||
+          idStr.includes(q) ||
           s.street1?.toLowerCase().includes(q) ||
           s.street2?.toLowerCase().includes(q)
         );

@@ -1,15 +1,31 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { getBusStops } from "@/lib/api";
 import { useStopOverrides } from "@/hooks/useStopOverrides";
 import { useCustomStops, createCustomStop, deleteCustomStop } from "@/hooks/useCustomStops";
+import { useGtfsSnapshot } from "@/hooks/useGtfsSnapshot";
+import { useCity } from "@/lib/cityContext";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/components/Toast";
 import type { BusStop } from "@/lib/types";
 
+function feedIdFor(cityId: string, modeId: string): string | null {
+  if (cityId === "ar.amba" && modeId === "bus") return "gcba-colectivos-static";
+  if (cityId === "ar.amba" && modeId === "subte") return "gcba-subte-static";
+  return null;
+}
+
 export default function StopsPage() {
+  const { city, mode } = useCity();
+  const isMvdLegacy = city.legacyMvdEndpoint;
+  const isCabaSubte = city.id === "ar.amba" && mode.id === "subte";
+
+  const { data: gtfsIndex, loading: gtfsLoading } = useGtfsSnapshot(
+    feedIdFor(city.id, mode.id)
+  );
+
   const [stops, setStops] = useState<BusStop[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -21,17 +37,32 @@ export default function StopsPage() {
   const { toast } = useToast();
 
   useEffect(() => {
+    if (!isMvdLegacy) {
+      setStops([]);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     getBusStops()
       .then(setStops)
       .finally(() => setLoading(false));
-  }, []);
+  }, [isMvdLegacy]);
+
+  /// CABA stops del GTFS estático. Para subte mostramos solo `location_type=1`
+  /// (estaciones agrupadoras, ~108) y no andenes/entradas peatonales.
+  const cabaStops = useMemo(() => {
+    if (!gtfsIndex) return [];
+    const all = Array.from(gtfsIndex.stopsById.values());
+    return isCabaSubte ? all.filter((s) => s.location_type === 1) : all;
+  }, [gtfsIndex, isCabaSubte]);
 
   const filtered = stops.filter((s) => {
-    if (filterModified && !overrides[String(s.id)]) return false;
+    const idStr = String(s?.id ?? "");
+    if (filterModified && !overrides[idStr]) return false;
     if (!search.trim()) return true;
     const q = search.toLowerCase();
     return (
-      s.id.toString().includes(q) ||
+      idStr.includes(q) ||
       s.street1?.toLowerCase().includes(q) ||
       s.street2?.toLowerCase().includes(q)
     );
@@ -39,6 +70,76 @@ export default function StopsPage() {
 
   const modifiedCount = Object.keys(overrides).length;
   const suspendedCount = Object.values(overrides).filter((o) => o.suspended).length;
+
+  // CABA: tabla read-only de GTFS stops.
+  if (!isMvdLegacy) {
+    const filteredCaba = cabaStops.filter((s) => {
+      if (!search.trim()) return true;
+      const q = search.toLowerCase();
+      return (
+        s.stop_name.toLowerCase().includes(q) ||
+        s.stop_id.toLowerCase().includes(q) ||
+        (s.stop_code ?? "").toLowerCase().includes(q)
+      );
+    });
+    const label = isCabaSubte ? "Estaciones de Subte" : "Paradas de Colectivos";
+    return (
+      <div>
+        <div className="mb-8">
+          <h1 className="text-2xl font-bold text-text">{label} · {city.shortName}</h1>
+          <p className="mt-1 text-sm text-text-secondary">
+            {gtfsLoading ? "Cargando GTFS estático…" : `${cabaStops.length} ${isCabaSubte ? "estaciones" : "paradas"}.`}
+          </p>
+        </div>
+        <div className="mb-6">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Buscar por nombre o código…"
+            className="w-full rounded-xl border border-border bg-bg-input px-4 py-2.5 text-sm text-text placeholder:text-text-muted focus:border-border-focus focus:ring-1 focus:ring-border-focus"
+          />
+        </div>
+        {gtfsLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          </div>
+        ) : (
+          <section className="rounded-2xl border border-border bg-bg-card overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-bg-subtle text-text-secondary">
+                  <tr>
+                    <th className="px-4 py-2 text-left text-xs uppercase tracking-wider font-semibold">ID</th>
+                    <th className="px-4 py-2 text-left text-xs uppercase tracking-wider font-semibold">Nombre</th>
+                    <th className="px-4 py-2 text-left text-xs uppercase tracking-wider font-semibold">Código</th>
+                    <th className="px-4 py-2 text-right text-xs uppercase tracking-wider font-semibold">Lat / Lng</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {filteredCaba.slice(0, 500).map((s) => (
+                    <tr key={s.stop_id}>
+                      <td className="px-4 py-2 font-mono text-xs text-text">{s.stop_id}</td>
+                      <td className="px-4 py-2 text-text">{s.stop_name}</td>
+                      <td className="px-4 py-2 text-text-secondary">{s.stop_code ?? "—"}</td>
+                      <td className="px-4 py-2 text-right text-text-secondary tabular-nums font-mono text-xs">
+                        {s.stop_lat.toFixed(4)}, {s.stop_lon.toFixed(4)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {filteredCaba.length > 500 && (
+              <p className="border-t border-border px-4 py-2 text-center text-xs text-text-muted">
+                Mostrando primeras 500 de {filteredCaba.length}. Filtrá para ver más.
+              </p>
+            )}
+          </section>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div>

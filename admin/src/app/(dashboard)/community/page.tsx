@@ -8,9 +8,12 @@ import {
   type CommunityBus,
 } from "@/hooks/useCommunityBuses";
 import { banUser, addStrike } from "@/hooks/useUsers";
+import { useCity } from "@/lib/cityContext";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/components/Toast";
 import { COMPANY_COLORS } from "@/lib/types";
+
+const DEFAULT_CITY_ID = "uy.mvd-area-metro";
 
 function timeAgo(date: Date): string {
   const secs = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -155,8 +158,16 @@ function BusRow({ bus }: { bus: CommunityBus }) {
 }
 
 export default function CommunityPage() {
-  const { buses, loading } = useCommunityBuses();
+  const { city } = useCity();
+  const { buses: rawBuses, loading } = useCommunityBuses();
   const [search, setSearch] = useState("");
+
+  // City-scope: docs sin `cityId` se asumen Mvd. Cuando se creen reportes BA
+  // serán tagged con cityId="ar.amba" desde iOS (Sprint 13 BA Comunidad).
+  const buses = rawBuses.filter((b) => {
+    const bCity = (b as { cityId?: string }).cityId ?? DEFAULT_CITY_ID;
+    return bCity === city.id;
+  });
 
   const filtered = search.trim()
     ? buses.filter((b) => {

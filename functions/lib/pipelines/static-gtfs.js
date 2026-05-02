@@ -36,6 +36,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const readline = require("readline");
 const axios = require("axios");
 const AdmZip = require("adm-zip");
 const { parse: parseCsv } = require("csv-parse/sync");
@@ -93,8 +94,29 @@ function inBbox(lat, lng, bbox) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchZip(url) {
-  const r = await axios.get(url, { responseType: "arraybuffer", timeout: 120_000, maxContentLength: 500 * 1024 * 1024 });
-  return Buffer.from(r.data);
+  // User-Agent explícito: el proxy GCBA (apitransporte.buenosaires.gob.ar)
+  // rechaza el default de axios. Otros publishers (datos abiertos GCBA,
+  // Mobility Database) lo aceptan, así que es seguro por defecto.
+  // Retry una vez con delay si 5xx — el proxy GCBA es flaky en cold-start
+  // (memoria `project_vamo_ba.md`: 500 SSLHandshakeException intermitente).
+  const reqOpts = {
+    responseType:    "arraybuffer",
+    timeout:         120_000,
+    maxContentLength: 500 * 1024 * 1024,
+    headers:         { "User-Agent": "Vamo/1.0" },
+  };
+  try {
+    const r = await axios.get(url, reqOpts);
+    return Buffer.from(r.data);
+  } catch (e) {
+    const status = e.response?.status;
+    if (status && status >= 500 && status < 600) {
+      await new Promise((res) => setTimeout(res, 2000));
+      const r = await axios.get(url, reqOpts);
+      return Buffer.from(r.data);
+    }
+    throw e;
+  }
 }
 
 /**
@@ -367,10 +389,80 @@ function strongCascadeFilter(parsed, bboxFiltered, dir) {
 }
 
 /**
+ * Construye índice `stopsByRoute: { route_id: [stop_id, ...] }` a partir de
+ * stop_times.txt + trips.txt. Permite al cliente saber qué paradas sirve cada
+ * línea sin tener que traerse stop_times completo (~10-700MB descomprimido
+ * según feed). El índice resultante para CABA pesa ~150-300KB gzip.
+ *
+ * Devuelve `null` si no hay stop_times.txt o si el feed config indica
+ * `skipStopsByRoute: true` (escape para feeds demasiado grandes que pegan OOM).
+ *
+ * Memory: streaming line-by-line. CABA tiene ~13M filas (~700MB descomprimido)
+ * y `parseCsv(text)` excedía el string limit de V8 (~512MB). Acá leemos linea
+ * a linea con `readline` + parser CSV minimalista (no soportamos quotes —
+ * stop_times.txt rara vez los usa). Memory pico ~50MB del Map + Set incremental.
+ */
+async function buildStopsByRoute(parsed, dir, feedConfig = {}) {
+  if (feedConfig.skipStopsByRoute) return null;
+  const stopTimesPath = path.join(dir, "stop_times.txt");
+  if (!fs.existsSync(stopTimesPath)) return null;
+
+  // Mapa trip_id → route_id (de trips ya filtrados).
+  const tripToRoute = new Map();
+  for (const t of parsed.trips) {
+    tripToRoute.set(t.trip_id, t.route_id);
+  }
+  // Set de stop_ids retenidos tras el bbox filter — descartamos stop_times
+  // que apuntan a stops fuera del bbox (no nos interesan en el output).
+  const keptStopIds = new Set(parsed.stops.map((s) => s.stop_id));
+
+  const fileStream = fs.createReadStream(stopTimesPath, { encoding: "utf8" });
+  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+
+  let header = null;
+  let stopIdCol = -1;
+  let tripIdCol = -1;
+  const setByRoute = new Map(); // route_id → Set<stop_id>
+
+  for await (const rawLine of rl) {
+    const line = rawLine.charCodeAt(0) === 0xFEFF ? rawLine.slice(1) : rawLine; // strip BOM en línea 0
+    if (header === null) {
+      header = line.split(",").map((h) => h.trim());
+      stopIdCol = header.indexOf("stop_id");
+      tripIdCol = header.indexOf("trip_id");
+      if (stopIdCol < 0 || tripIdCol < 0) {
+        return null; // header no esperado, salir limpio
+      }
+      continue;
+    }
+    if (!line) continue;
+    // Parser CSV minimalista: split por coma. GTFS stop_times.txt rara vez
+    // usa quotes (no hay nombres con comas en estos campos). Si fuese
+    // necesario soportarlos, refactor a `csv-parse/stream`.
+    const fields = line.split(",");
+    const tripId = fields[tripIdCol];
+    const stopId = fields[stopIdCol];
+    if (!tripId || !stopId) continue;
+    const routeId = tripToRoute.get(tripId);
+    if (!routeId) continue;
+    if (!keptStopIds.has(stopId)) continue;
+    let s = setByRoute.get(routeId);
+    if (!s) { s = new Set(); setByRoute.set(routeId, s); }
+    s.add(stopId);
+  }
+
+  const out = {};
+  for (const [routeId, set] of setByRoute) {
+    out[routeId] = Array.from(set);
+  }
+  return out;
+}
+
+/**
  * Snapshot final con counts y metadata.
  */
 function buildSnapshot({ feedConfig, parsed, generatedAt = new Date().toISOString() }) {
-  return {
+  const out = {
     feedId:        feedConfig.feedId,
     sourceUrl:     feedConfig.sourceUrl,
     cityIds:       feedConfig.cityIds,
@@ -397,6 +489,8 @@ function buildSnapshot({ feedConfig, parsed, generatedAt = new Date().toISOStrin
     agency:        parsed.agency,
     feedInfo:      parsed.feedInfo,
   };
+  if (parsed.stopsByRoute) out.stopsByRoute = parsed.stopsByRoute;
+  return out;
 }
 
 /**
@@ -408,7 +502,12 @@ function buildSnapshot({ feedConfig, parsed, generatedAt = new Date().toISOStrin
  */
 async function runPipeline(feedConfig, options = {}) {
   const t0 = Date.now();
-  const buf = await fetchZip(feedConfig.sourceUrl);
+  // `fetchUrl` lo inyecta el endpoint cuando el feed requiere auth (ver
+  // `runStaticGtfsPipeline` en index.js). Default = `sourceUrl` para feeds
+  // públicos. La URL pública (`sourceUrl`) sigue siendo la que se serializa
+  // en el snapshot — no exponemos credenciales.
+  const fetchUrl = feedConfig.fetchUrl || feedConfig.sourceUrl;
+  const buf = await fetchZip(fetchUrl);
   const dir = extractToTmp(buf, feedConfig.feedId);
   try {
     const parsed = parseAll(dir);
@@ -443,6 +542,7 @@ async function runPipeline(feedConfig, options = {}) {
     const finalParsed = options.strongCascade
       ? strongCascadeFilter(parsed, bboxFiltered, dir)
       : bboxFiltered;
+    finalParsed.stopsByRoute = await buildStopsByRoute(finalParsed, dir, feedConfig);
     const snapshot = buildSnapshot({ feedConfig, parsed: finalParsed });
     return { snapshot, dir, durationMs: Date.now() - t0 };
   } finally {
@@ -454,12 +554,13 @@ async function runPipeline(feedConfig, options = {}) {
  * Variante para testing: dado un dir local con archivos GTFS extraídos, corre
  * sólo parse + filtros (saltea fetch + extract).
  */
-function runPipelineFromLocalDir(feedConfig, dir, options = {}) {
+async function runPipelineFromLocalDir(feedConfig, dir, options = {}) {
   const parsed = parseAll(dir);
   const bboxFiltered = filterByBbox(parsed, feedConfig.bbox);
   const finalParsed = options.strongCascade
     ? strongCascadeFilter(parsed, bboxFiltered, dir)
     : bboxFiltered;
+  finalParsed.stopsByRoute = await buildStopsByRoute(finalParsed, dir, feedConfig);
   return buildSnapshot({ feedConfig, parsed: finalParsed });
 }
 
@@ -479,7 +580,7 @@ function runPipelineFromLocalDir(feedConfig, dir, options = {}) {
 // `JSON.stringify(buildSnapshot(...))`.
 
 const ARRAY_FIELDS = ["stops", "routes", "trips", "shapes", "calendar", "calendarDates", "agency", "feedInfo"];
-const SCALAR_FIELDS = ["feedId", "sourceUrl", "cityIds", "bbox", "license", "generatedAt", "counts"];
+const SCALAR_FIELDS = ["feedId", "sourceUrl", "cityIds", "bbox", "license", "generatedAt", "counts", "stopsByRoute"];
 
 /**
  * Pone backpressure en un Writable: si el buffer interno está lleno, espera el
@@ -546,6 +647,7 @@ module.exports = {
   parseAll,
   filterByBbox,
   strongCascadeFilter,
+  buildStopsByRoute,
   buildSnapshot,
   runPipeline,
   runPipelineFromLocalDir,

@@ -9,9 +9,20 @@ import { useCommunityBuses } from "@/hooks/useCommunityBuses";
 import { useStopOverrides } from "@/hooks/useStopOverrides";
 import { useBackendHealth } from "@/hooks/useBackendHealth";
 import { useActivityFeed } from "@/hooks/useActivityFeed";
+import { useVehicles } from "@/hooks/useVehicles";
+import { useSubteForecast } from "@/hooks/useSubteForecast";
+import { useGtfsSnapshot } from "@/hooks/useGtfsSnapshot";
+import { useCity } from "@/lib/cityContext";
 import { detectAnomalies, type Anomaly } from "@/lib/anomaly";
 import { COMPANY_COLORS } from "@/lib/types";
 import { useAuth } from "@/lib/auth";
+
+/// Mapping ciudad+modo activo a feedId del snapshot GTFS estático.
+function feedIdFor(cityId: string, modeId: string): string | null {
+  if (cityId === "ar.amba" && modeId === "bus") return "gcba-colectivos-static";
+  if (cityId === "ar.amba" && modeId === "subte") return "gcba-subte-static";
+  return null;
+}
 import {
   PlusIcon,
   ChevronRight,
@@ -279,11 +290,21 @@ function DrawerEmpresas({ buses }: { buses: import("@/lib/types").Bus[] }) {
 // ─── MAIN ───
 export default function HomePage() {
   const { user } = useAuth();
-  const { buses } = useBuses(15000);
+  const { city, mode } = useCity();
+  const isMvdLegacy = city.legacyMvdEndpoint;
+  const isCabaSubte = city.id === "ar.amba" && mode.id === "subte";
+
+  // Mvd legacy
+  const { buses } = useBuses(15000, isMvdLegacy);
   const { alerts } = useAlerts();
   const { buses: communityBuses } = useCommunityBuses();
   const { overrides } = useStopOverrides();
   const health = useBackendHealth(30000);
+
+  // Multi-city
+  const { vehicles } = useVehicles(15000);
+  const { data: subteForecast } = useSubteForecast(isCabaSubte, 15000);
+  const { data: gtfsIndex } = useGtfsSnapshot(feedIdFor(city.id, mode.id));
 
   const [drawerOpen, setDrawerOpen] = useState(true);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("actividad");
@@ -293,15 +314,38 @@ export default function HomePage() {
   const criticalAlerts = activeAlerts.filter((a) => a.severity === "critical");
   const suspendedStops = Object.values(overrides).filter((o) => o.suspended);
 
+  // Anomalies y BriefingCard hoy son Mvd-bound (consumen Bus[] enriquecido).
+  // Cuando la ciudad no es Mvd, vacío hasta hacer multi-city aware (post-launch).
   const anomalies = useMemo(
     () =>
-      detectAnomalies({
-        buses,
-        backendLatencyMs: health.latencyMs,
-        communityBusesCount: communityBuses.length,
-      }),
-    [buses, health.latencyMs, communityBuses.length]
+      isMvdLegacy
+        ? detectAnomalies({
+            buses,
+            backendLatencyMs: health.latencyMs,
+            communityBusesCount: communityBuses.length,
+          })
+        : [],
+    [isMvdLegacy, buses, health.latencyMs, communityBuses.length]
   );
+
+  // Stat principal del HUD según ciudad+modo
+  const primaryStat = useMemo(() => {
+    if (isMvdLegacy) {
+      return { label: "Buses", value: buses.length, sub: "activos" };
+    }
+    if (isCabaSubte) {
+      const stationCount = gtfsIndex
+        ? Array.from(gtfsIndex.stopsById.values()).filter((s) => s.location_type === 1).length
+        : 0;
+      const tripCount = subteForecast?.tripUpdates.length ?? 0;
+      return { label: "Estaciones", value: stationCount, sub: `${tripCount} trenes` };
+    }
+    return {
+      label: mode.label,
+      value: vehicles.length,
+      sub: "activos",
+    };
+  }, [isMvdLegacy, isCabaSubte, buses.length, vehicles.length, gtfsIndex, subteForecast, mode]);
 
   const firstName = user?.displayName?.split(" ")?.[0] || "";
   const greeting =
@@ -311,21 +355,33 @@ export default function HomePage() {
         ? "Buenas tardes"
         : "Buenas noches";
 
-  const tabs: { id: DrawerTab; label: string; count: number | null }[] = [
-    { id: "actividad", label: "Actividad", count: null },
-    { id: "alertas", label: "Alertas", count: activeAlerts.length },
-    { id: "anomalias", label: "Anomalías", count: anomalies.length },
-    { id: "empresas", label: "Flota", count: null },
-  ];
+  const tabs: { id: DrawerTab; label: string; count: number | null }[] = isMvdLegacy
+    ? [
+        { id: "actividad", label: "Actividad", count: null },
+        { id: "alertas", label: "Alertas", count: activeAlerts.length },
+        { id: "anomalias", label: "Anomalías", count: anomalies.length },
+        { id: "empresas", label: "Flota", count: null },
+      ]
+    : [
+        { id: "actividad", label: "Actividad", count: null },
+        { id: "alertas", label: "Alertas", count: activeAlerts.length },
+      ];
 
   return (
     <div className="relative h-full w-full">
       {/* MAPA FULL-VIEWPORT */}
       <div className="absolute inset-0">
         <LiveMap
-          buses={buses}
-          communityBuses={communityBuses}
-          showStops={false}
+          buses={isMvdLegacy ? buses : []}
+          communityBuses={isMvdLegacy ? communityBuses : []}
+          vehicles={isMvdLegacy ? [] : vehicles}
+          gtfsStops={gtfsIndex ? Array.from(gtfsIndex.stopsById.values()) : []}
+          onlyParentStations={isCabaSubte}
+          shapes={gtfsIndex && isCabaSubte ? gtfsIndex.snapshot.shapes : []}
+          subteForecast={subteForecast}
+          showStops={isCabaSubte}
+          center={city.defaultCenter}
+          zoom={city.defaultZoom}
         />
       </div>
 
@@ -344,9 +400,9 @@ export default function HomePage() {
           </div>
           <div className="grid grid-cols-2">
             <HudStat
-              label="Buses"
-              value={buses.length}
-              sub="activos"
+              label={primaryStat.label}
+              value={primaryStat.value}
+              sub={primaryStat.sub}
               accent="success"
               href="/map"
             />
@@ -364,16 +420,20 @@ export default function HomePage() {
             />
             <HudStat
               label="Comunidad"
-              value={communityBuses.length}
-              sub="en vivo"
+              value={isMvdLegacy ? communityBuses.length : 0}
+              sub={isMvdLegacy ? "en vivo" : "—"}
               accent="neutral"
               href="/community"
             />
             <HudStat
               label="Paradas"
-              value={Object.keys(overrides).length}
-              sub={suspendedStops.length > 0 ? `${suspendedStops.length} suspendidas` : "editadas"}
-              accent={suspendedStops.length > 0 ? "warning" : "neutral"}
+              value={isMvdLegacy ? Object.keys(overrides).length : (gtfsIndex?.snapshot.counts.stops ?? 0)}
+              sub={
+                isMvdLegacy
+                  ? suspendedStops.length > 0 ? `${suspendedStops.length} suspendidas` : "editadas"
+                  : "GTFS"
+              }
+              accent={isMvdLegacy && suspendedStops.length > 0 ? "warning" : "neutral"}
               href="/stops"
             />
           </div>
@@ -385,7 +445,7 @@ export default function HomePage() {
             {greeting}{firstName ? `, ${firstName}` : ""}.
           </p>
           <p className="text-[11px] text-text-secondary">
-            Panel de operaciones de Vamo · Montevideo
+            Panel de operaciones de Vamo · {city.longName} · {mode.label}
           </p>
         </div>
       </div>
@@ -422,8 +482,9 @@ export default function HomePage() {
         </Link>
       </div>
 
-      {/* Briefing button — bottom-left */}
-      <div className="absolute bottom-4 left-4">
+      {/* Briefing button — bottom-left. Solo Mvd hoy (BriefingCard consume
+          Bus[] + anomalies Mvd-bound). Multi-city briefing es post-launch. */}
+      <div className="absolute bottom-4 left-4" hidden={!isMvdLegacy}>
         {!briefingOpen ? (
           <button
             onClick={() => setBriefingOpen(true)}

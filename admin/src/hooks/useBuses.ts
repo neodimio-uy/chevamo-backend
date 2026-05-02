@@ -4,13 +4,18 @@ import { useEffect, useState } from "react";
 import { getBuses } from "@/lib/api";
 import type { Bus } from "@/lib/types";
 
-export function useBuses(pollMs = 30000) {
+export function useBuses(pollMs: number = 30000, enabled: boolean = true) {
   const [buses, setBuses] = useState<Bus[]>([]);
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!enabled) {
+      setBuses([]);
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
 
     async function fetchBuses() {
@@ -34,7 +39,7 @@ export function useBuses(pollMs = 30000) {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [pollMs]);
+  }, [pollMs, enabled]);
 
   return { buses, loading, lastUpdate, error };
 }

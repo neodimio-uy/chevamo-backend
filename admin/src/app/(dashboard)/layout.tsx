@@ -8,6 +8,7 @@ import StatusBar from "@/components/StatusBar";
 import CommandPalette from "@/components/CommandPalette";
 import KeyboardCheatsheet from "@/components/KeyboardCheatsheet";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboard";
+import { CityProvider } from "@/lib/cityContext";
 
 // Páginas que usan el layout completo sin padding (map-first)
 const FULL_BLEED = new Set(["/home", "/map"]);
@@ -42,21 +43,23 @@ export default function DashboardLayout({
 
   return (
     <AuthGuard>
-      <div className="flex h-screen bg-bg overflow-hidden">
-        <Sidebar />
-        <div className="flex flex-1 flex-col overflow-hidden">
-          <StatusBar onCommandPalette={() => setPaletteOpen(true)} />
-          {isFullBleed ? (
-            <main className="relative flex-1 overflow-hidden">{children}</main>
-          ) : (
-            <main className="flex-1 overflow-y-auto">
-              <div className="mx-auto max-w-7xl px-8 py-7">{children}</div>
-            </main>
-          )}
+      <CityProvider>
+        <div className="flex h-screen bg-bg overflow-hidden">
+          <Sidebar />
+          <div className="flex flex-1 flex-col overflow-hidden">
+            <StatusBar onCommandPalette={() => setPaletteOpen(true)} />
+            {isFullBleed ? (
+              <main className="relative flex-1 overflow-hidden">{children}</main>
+            ) : (
+              <main className="flex-1 overflow-y-auto">
+                <div className="mx-auto max-w-7xl px-8 py-7">{children}</div>
+              </main>
+            )}
+          </div>
         </div>
-      </div>
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
-      <KeyboardCheatsheet open={cheatOpen} onClose={() => setCheatOpen(false)} />
+        <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+        <KeyboardCheatsheet open={cheatOpen} onClose={() => setCheatOpen(false)} />
+      </CityProvider>
     </AuthGuard>
   );
 }

@@ -3,6 +3,8 @@
 import { useMemo, useState } from "react";
 import { useBusOverrides, setBusOverride, clearBusOverride } from "@/hooks/useBusOverrides";
 import { useBuses } from "@/hooks/useBuses";
+import { useVehicles } from "@/hooks/useVehicles";
+import { useCity } from "@/lib/cityContext";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/components/Toast";
 
@@ -14,13 +16,20 @@ import { useToast } from "@/components/Toast";
  * o sobrescribir coordenadas si el feed reporta mal.
  */
 export default function BusesPage() {
-  const { buses, loading } = useBuses();
+  const { city, mode } = useCity();
+  const isMvdLegacy = city.legacyMvdEndpoint;
+  const isCabaSubte = city.id === "ar.amba" && mode.id === "subte";
+
+  const { buses, loading: busesLoading } = useBuses(30000, isMvdLegacy);
+  const { vehicles, loading: vehiclesLoading } = useVehicles(15000);
   const { overrides } = useBusOverrides();
   const { user } = useAuth();
   const { toast } = useToast();
   const [search, setSearch] = useState("");
   const [showOnlyOverridden, setShowOnlyOverridden] = useState(false);
   const [pendingId, setPendingId] = useState<string | null>(null);
+
+  const loading = isMvdLegacy ? busesLoading : vehiclesLoading;
 
   const overrideMap = useMemo(() => {
     const m = new Map<string, (typeof overrides)[0]>();
@@ -80,6 +89,91 @@ export default function BusesPage() {
     }
   };
 
+  // CABA Subte: la página `/buses` no aplica (subte no es GPS de trenes).
+  if (isCabaSubte) {
+    return (
+      <div className="space-y-4">
+        <header>
+          <h1 className="text-2xl font-bold text-text">{mode.label}</h1>
+          <p className="mt-1 text-sm text-text-secondary">
+            El subte CABA no expone posiciones GPS de trenes. Mirá próximos arribos por estación en{" "}
+            <a href="/map" className="text-primary underline">Mapa</a> o{" "}
+            <a href="/stops" className="text-primary underline">Paradas</a>.
+          </p>
+        </header>
+      </div>
+    );
+  }
+
+  // CABA Bus: tabla read-only de TransitVehicle (sin overrides — overrides
+  // son Mvd-only por ahora; el flow de override individual no existe en CABA).
+  if (!isMvdLegacy) {
+    return (
+      <div className="space-y-4">
+        <header className="flex items-center justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold text-text">{mode.label} · {city.shortName}</h1>
+            <p className="mt-1 text-sm text-text-secondary">
+              {vehicles.length} vehículos en vivo. Overrides individuales solo en Mvd.
+            </p>
+          </div>
+          <input
+            type="text"
+            placeholder="Buscar por línea / id / agencia…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="rounded-lg border border-border bg-bg px-3 py-2 text-sm text-text w-72"
+          />
+        </header>
+        <section className="rounded-2xl border border-border bg-bg-card overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-bg-subtle text-text-secondary">
+                <tr>
+                  <th className="px-4 py-2 text-left text-xs uppercase tracking-wider font-semibold">ID</th>
+                  <th className="px-4 py-2 text-left text-xs uppercase tracking-wider font-semibold">Línea</th>
+                  <th className="px-4 py-2 text-left text-xs uppercase tracking-wider font-semibold">Agencia</th>
+                  <th className="px-4 py-2 text-left text-xs uppercase tracking-wider font-semibold">Destino</th>
+                  <th className="px-4 py-2 text-right text-xs uppercase tracking-wider font-semibold">Velocidad</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {loading && (
+                  <tr><td colSpan={5} className="px-4 py-8 text-center text-text-muted">Cargando…</td></tr>
+                )}
+                {!loading && vehicles.length === 0 && (
+                  <tr><td colSpan={5} className="px-4 py-8 text-center text-text-muted">Sin vehículos en vivo.</td></tr>
+                )}
+                {vehicles
+                  .filter((v) => {
+                    const q = search.trim().toLowerCase();
+                    if (!q) return true;
+                    const line = (v.trip?.routeShortName ?? v.displayLabel ?? "").toLowerCase();
+                    const agency = (v.agency?.name ?? "").toLowerCase();
+                    const headsign = (v.trip?.headsign ?? "").toLowerCase();
+                    return line.includes(q) || v.id.toLowerCase().includes(q) || agency.includes(q) || headsign.includes(q);
+                  })
+                  .slice(0, 200)
+                  .map((v) => (
+                    <tr key={v.id}>
+                      <td className="px-4 py-2 font-mono text-xs text-text">{v.id.split(":").pop()}</td>
+                      <td className="px-4 py-2 text-text font-semibold">{v.trip?.routeShortName ?? v.displayLabel ?? "—"}</td>
+                      <td className="px-4 py-2 text-text-secondary truncate max-w-[200px]">{v.agency?.name ?? "—"}</td>
+                      <td className="px-4 py-2 text-text-secondary truncate max-w-[260px]">{v.trip?.headsign ?? "—"}</td>
+                      <td className="px-4 py-2 text-right text-text-secondary tabular-nums">
+                        {v.position.speed != null ? `${(v.position.speed * 3.6).toFixed(0)} km/h` : "—"}
+                      </td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  // Mvd urbano: tabla original con overrides.
   return (
     <div className="space-y-4">
       <header className="flex items-center justify-between gap-4">

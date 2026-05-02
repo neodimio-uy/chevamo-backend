@@ -9,20 +9,32 @@ import {
   SEVERITY_COLORS,
   KIND_OPTIONS,
 } from "@/hooks/useIncidents";
+import { useCity } from "@/lib/cityContext";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/components/Toast";
 import { INCIDENT_KIND_LABELS, type IncidentKind, type IncidentSeverity } from "@/lib/extended-types";
 
+const DEFAULT_CITY_ID = "uy.mvd-area-metro";
+
 const STATUS_LABELS = { active: "Activo", monitoring: "Monitoreando", resolved: "Resuelto" } as const;
 
 export default function IncidentsPage() {
+  const { city } = useCity();
   const { incidents, loading } = useIncidents();
   const { user } = useAuth();
   const { toast } = useToast();
   const [showForm, setShowForm] = useState(false);
   const [filter, setFilter] = useState<"all" | "active" | "resolved">("active");
 
-  const filtered = incidents.filter((i) => {
+  // City-scope: docs sin `cityId` field se asumen Mvd (compatibilidad con
+  // schema previo). Cuando creemos incidents nuevos vamos a setear cityId
+  // explícito al de la ciudad activa al momento de crear.
+  const cityFiltered = incidents.filter((i) => {
+    const incCity = (i as { cityId?: string }).cityId ?? DEFAULT_CITY_ID;
+    return incCity === city.id;
+  });
+
+  const filtered = cityFiltered.filter((i) => {
     if (filter === "all") return true;
     if (filter === "active") return i.status !== "resolved";
     if (filter === "resolved") return i.status === "resolved";

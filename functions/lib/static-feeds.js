@@ -69,6 +69,21 @@ const STATIC_FEEDS = [
     notes:               "GTFS estático colectivos CABA. Cubre solo CABA (no AMBA entera — provincia BsAs requiere otros feeds). Complementa el feed RT `gcba-vehicles-simple` que sí cubre AMBA.",
   },
   {
+    feedId:              "gcba-subte-static",
+    cityIds:             ["ar.amba"],
+    // Endpoint protegido por API gateway de GCBA. El runStaticGtfsPipeline
+    // detecta `requiresAuth === "BA_TRANSPORT"` e inyecta `client_id` +
+    // `client_secret` desde Secret Manager antes de pasar al pipeline.
+    sourceUrl:           "https://apitransporte.buenosaires.gob.ar/subtes/feed-gtfs",
+    requiresAuth:        "BA_TRANSPORT",
+    // bbox CABA tight — el GTFS subte solo cubre CABA por definición, no
+    // hace falta filtrar pero el pipeline lo aplica de todos modos.
+    bbox:                { swLat: -34.72, swLng: -58.55, neLat: -34.50, neLng: -58.30 },
+    refreshIntervalDays: 30,
+    license:             "GP-SBASE — Subterráneos de Buenos Aires SE — CC-BY-2.5-AR",
+    notes:               "GTFS estático SBASE: 9 routes (A/B/C/D/E/H + Premetro), 707 stops, pathways, transfers, fares. Vigente hasta 2026-12-31. ZIP ~48KB (snapshot final esperado <100KB gzip).",
+  },
+  {
     feedId:              "mtop-suburban-static",
     cityIds:             ["uy.mvd-area-metro", "uy.long-distance"],
     sourceUrl:           "https://catalogodatos.gub.uy/dataset/1d50ccf7-121d-48a7-951e-28a02858d24e/resource/9f44b654-751a-42a4-a481-af91b7c9a2e4/download",
