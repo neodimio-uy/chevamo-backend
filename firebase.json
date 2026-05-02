@@ -13,26 +13,6 @@
       ]
     }
   ],
-  "hosting": {
-    "public": "admin/out",
-    "cleanUrls": true,
-    "trailingSlash": false,
-    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
-    "rewrites": [
-      {
-        "source": "/alerts/edit",
-        "destination": "/alerts/edit.html"
-      },
-      {
-        "source": "/stops/detail",
-        "destination": "/stops/detail.html"
-      },
-      {
-        "source": "/lines/detail",
-        "destination": "/lines/detail.html"
-      }
-    ]
-  },
   "firestore": {
     "rules": "firestore.rules",
     "indexes": "firestore.indexes.json"
