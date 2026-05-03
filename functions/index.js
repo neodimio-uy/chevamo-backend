@@ -3185,10 +3185,17 @@ exports.runStaticGtfsPipeline = onRequest(
       }
       logger.info(`runStaticGtfsPipeline: ${feedId} pipeline OK en ${durationMs}ms (stops=${snapshot.counts.stops}, routes=${snapshot.counts.routes}, trips=${snapshot.counts.trips}, shapes=${snapshot.counts.shapes})`);
 
-      // Serializar + gzip (Cloud Storage acepta cualquier blob, gzip aliviana costo de transferencia)
-      const json = JSON.stringify(snapshot);
-      const gzipped = zlib.gzipSync(Buffer.from(json, "utf8"), { level: 9 });
+      // Serializar + comprimir en gzip y brotli. Brotli es 20-30% más eficiente
+      // para JSON (snapshot CABA: 8MB gz → ~5.5MB br). Subimos ambos —
+      // browsers modernos prefieren `.json.br`, fallback `.json.gz` si el
+      // cliente no soporta brotli (raro, todo browser >2017 lo hace).
+      const jsonBuffer = Buffer.from(JSON.stringify(snapshot), "utf8");
+      const gzipped = zlib.gzipSync(jsonBuffer, { level: 9 });
+      const brotlied = zlib.brotliCompressSync(jsonBuffer, {
+        params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 6 },
+      });
       const sizeMb = (gzipped.length / 1024 / 1024).toFixed(2);
+      const sizeMbBr = (brotlied.length / 1024 / 1024).toFixed(2);
 
       // Path con date EN LA TZ DE LA CIUDAD (no UTC). Si Lisboa procesa a
       // las 02:30 local del 29-abril (= 01:30 UTC del 29-abril), el snapshot
@@ -3204,10 +3211,12 @@ exports.runStaticGtfsPipeline = onRequest(
       const datePath  = dateLocal.replace(/-/g, ""); // "20260429"
 
       const bucket = admin.storage().bucket(); // bucket default vamo-dbad6.firebasestorage.app
-      const latestPath = `gtfs-snapshots/${feedId}/latest/snapshot.json.gz`;
-      const datedPath  = `gtfs-snapshots/${feedId}/${datePath}/snapshot.json.gz`;
-      const metaPath   = `gtfs-snapshots/${feedId}/${datePath}/meta.json`;
-      const latestMeta = `gtfs-snapshots/${feedId}/latest/meta.json`;
+      const latestPath   = `gtfs-snapshots/${feedId}/latest/snapshot.json.gz`;
+      const datedPath    = `gtfs-snapshots/${feedId}/${datePath}/snapshot.json.gz`;
+      const latestPathBr = `gtfs-snapshots/${feedId}/latest/snapshot.json.br`;
+      const datedPathBr  = `gtfs-snapshots/${feedId}/${datePath}/snapshot.json.br`;
+      const metaPath     = `gtfs-snapshots/${feedId}/${datePath}/meta.json`;
+      const latestMeta   = `gtfs-snapshots/${feedId}/latest/meta.json`;
 
       const fetchedAtUtc = new Date().toISOString();
       const meta = {
@@ -3223,23 +3232,31 @@ exports.runStaticGtfsPipeline = onRequest(
           timeZone: local.tz, hour12: false,
         }).replace(" ", "T") + " (" + local.tz + ")",
         durationMs,
-        snapshotSizeBytes: gzipped.length,
-        counts:            snapshot.counts,
+        snapshotSizeBytes:   gzipped.length,
+        snapshotSizeBytesBr: brotlied.length,
+        counts:              snapshot.counts,
         strongCascade,
       };
 
+      const baseMetadata = {
+        feedId,
+        strongCascade:     String(strongCascade),
+        generatedAt:       snapshot.generatedAt,
+        cityTimezone:      local.tz,
+        snapshotDateLocal: dateLocal,
+        counts:            JSON.stringify(snapshot.counts),
+      };
       const writeOpts = {
-        contentType:        "application/json",
-        contentEncoding:    "gzip",
-        cacheControl:       "public, max-age=3600",
-        metadata: {
-          feedId,
-          strongCascade:     String(strongCascade),
-          generatedAt:       snapshot.generatedAt,
-          cityTimezone:      local.tz,
-          snapshotDateLocal: dateLocal,
-          counts:            JSON.stringify(snapshot.counts),
-        },
+        contentType:     "application/json",
+        contentEncoding: "gzip",
+        cacheControl:    "public, max-age=3600",
+        metadata:        baseMetadata,
+      };
+      const writeOptsBr = {
+        contentType:     "application/json",
+        contentEncoding: "br",
+        cacheControl:    "public, max-age=3600",
+        metadata:        baseMetadata,
       };
       const metaWriteOpts = {
         contentType:  "application/json",
@@ -3247,10 +3264,12 @@ exports.runStaticGtfsPipeline = onRequest(
       };
       const metaJson = JSON.stringify(meta, null, 2);
 
-      await bucket.file(latestPath).save(gzipped,           { metadata: writeOpts, resumable: false });
-      await bucket.file(datedPath).save(gzipped,            { metadata: writeOpts, resumable: false });
-      await bucket.file(metaPath).save(metaJson,            { metadata: metaWriteOpts, resumable: false });
-      await bucket.file(latestMeta).save(metaJson,          { metadata: metaWriteOpts, resumable: false });
+      await bucket.file(latestPath).save(gzipped,    { metadata: writeOpts,     resumable: false });
+      await bucket.file(datedPath).save(gzipped,     { metadata: writeOpts,     resumable: false });
+      await bucket.file(latestPathBr).save(brotlied, { metadata: writeOptsBr,   resumable: false });
+      await bucket.file(datedPathBr).save(brotlied,  { metadata: writeOptsBr,   resumable: false });
+      await bucket.file(metaPath).save(metaJson,     { metadata: metaWriteOpts, resumable: false });
+      await bucket.file(latestMeta).save(metaJson,   { metadata: metaWriteOpts, resumable: false });
 
       // Hacer público el snapshot para que el cliente iOS los descargue
       // sin auth desde `https://storage.googleapis.com/<bucket>/<path>`. Los
@@ -3258,6 +3277,8 @@ exports.runStaticGtfsPipeline = onRequest(
       try {
         await bucket.file(latestPath).makePublic();
         await bucket.file(datedPath).makePublic();
+        await bucket.file(latestPathBr).makePublic();
+        await bucket.file(datedPathBr).makePublic();
         await bucket.file(metaPath).makePublic();
         await bucket.file(latestMeta).makePublic();
       } catch (e) {
@@ -3265,17 +3286,20 @@ exports.runStaticGtfsPipeline = onRequest(
       }
 
       const totalDurationMs = Date.now() - t0;
-      logger.info(`runStaticGtfsPipeline: ${feedId} snapshot escrito (${sizeMb} MB gzip) en ${totalDurationMs}ms total`);
+      logger.info(`runStaticGtfsPipeline: ${feedId} snapshot escrito (${sizeMb} MB gzip / ${sizeMbBr} MB br) en ${totalDurationMs}ms total`);
 
       return ok(res, {
         feedId,
-        durationMs:    totalDurationMs,
-        pipelineMs:    durationMs,
-        snapshotSizeBytes: gzipped.length,
-        counts:        snapshot.counts,
+        durationMs:          totalDurationMs,
+        pipelineMs:          durationMs,
+        snapshotSizeBytes:   gzipped.length,
+        snapshotSizeBytesBr: brotlied.length,
+        counts:              snapshot.counts,
         paths: {
-          latest: `gs://${bucket.name}/${latestPath}`,
-          dated:  `gs://${bucket.name}/${datedPath}`,
+          latest:   `gs://${bucket.name}/${latestPath}`,
+          dated:    `gs://${bucket.name}/${datedPath}`,
+          latestBr: `gs://${bucket.name}/${latestPathBr}`,
+          datedBr:  `gs://${bucket.name}/${datedPathBr}`,
         },
       });
     } catch (e) {
