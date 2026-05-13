@@ -2,15 +2,14 @@
  * Catálogo de Jurisdictions (unidades administrativas).
  *
  * Una Jurisdiction es una unidad real con gobierno + límites administrativos:
- * Mvd, Canelones, San José, Maldonado, CABA, GBA, Madrid (capital), Madrid CA,
- * Barcelona, Lisboa, São Paulo, Bogotá, etc.
+ * Mvd, CABA, GBA, etc.
  *
  * Las Jurisdictions son la unidad atómica del modelo nuevo. El user **vive**
  * en una jurisdicción (no en un blob "Area Metro"). Después la juri se compone
  * con MetroArea (composición funcional) y NationalNetwork (overlay nacional).
  *
  * Cada entry define:
- *   - id: `<country>.<slug>` (ej `uy.mvd`, `ar.caba`, `es.madrid`)
+ *   - id: `<country>.<slug>` (ej `uy.mvd`, `ar.caba`)
  *   - country: ISO2 lowercase
  *   - displayName: nombre humano
  *   - boundingBox: bbox geográfico para validación de coords + zoom default
@@ -37,37 +36,6 @@ const JURISDICTIONS = [
     locale: "es-UY",
     parentMetroAreaIds: ["uy.mvd-area-metro"],
   },
-  {
-    id: "uy.canelones",
-    country: "UY",
-    displayName: "Canelones",
-    // Costa de Oro + Las Piedras + Pando + Ciudad de la Costa
-    boundingBox: { swLat: -34.93, swLng: -56.50, neLat: -34.40, neLng: -55.30 },
-    defaultMapCenter: { lat: -34.5226, lng: -56.2769 }, // Canelones capital
-    timezone: "America/Montevideo",
-    locale: "es-UY",
-    parentMetroAreaIds: ["uy.mvd-area-metro"],
-  },
-  {
-    id: "uy.san-jose",
-    country: "UY",
-    displayName: "San José",
-    boundingBox: { swLat: -34.85, swLng: -57.00, neLat: -34.05, neLng: -56.50 },
-    defaultMapCenter: { lat: -34.3375, lng: -56.7128 }, // San José de Mayo
-    timezone: "America/Montevideo",
-    locale: "es-UY",
-    parentMetroAreaIds: ["uy.mvd-area-metro"],
-  },
-  {
-    id: "uy.maldonado",
-    country: "UY",
-    displayName: "Maldonado / Punta del Este",
-    boundingBox: { swLat: -35.10, swLng: -55.20, neLat: -34.50, neLng: -54.20 },
-    defaultMapCenter: { lat: -34.9, lng: -54.95 },
-    timezone: "America/Montevideo",
-    locale: "es-UY",
-    parentMetroAreaIds: [], // Maldonado no es parte de Area Metro Mvd
-  },
 
   // ===========================================================================
   // ARGENTINA
@@ -92,116 +60,6 @@ const JURISDICTIONS = [
     timezone: "America/Argentina/Buenos_Aires",
     locale: "es-AR",
     parentMetroAreaIds: ["ar.amba"],
-  },
-
-  // ===========================================================================
-  // PORTUGAL
-  // ===========================================================================
-  {
-    id: "pt.lisboa",
-    country: "PT",
-    displayName: "Lisboa",
-    boundingBox: { swLat: 38.69, swLng: -9.23, neLat: 38.80, neLng: -9.07 },
-    defaultMapCenter: { lat: 38.7169, lng: -9.1399 }, // Rossio
-    timezone: "Europe/Lisbon",
-    locale: "pt-PT",
-    parentMetroAreaIds: ["pt.lisboa-area-metro"],
-  },
-
-  // ===========================================================================
-  // ESPAÑA
-  // ===========================================================================
-  {
-    id: "es.madrid",
-    country: "ES",
-    displayName: "Madrid",
-    boundingBox: { swLat: 40.20, swLng: -4.20, neLat: 40.70, neLng: -3.40 },
-    defaultMapCenter: { lat: 40.4168, lng: -3.7038 }, // Sol
-    timezone: "Europe/Madrid",
-    locale: "es-ES",
-    parentMetroAreaIds: ["es.madrid-area-metro"],
-  },
-  {
-    id: "es.barcelona",
-    country: "ES",
-    displayName: "Barcelona",
-    boundingBox: { swLat: 41.20, swLng: 1.90, neLat: 41.55, neLng: 2.30 },
-    defaultMapCenter: { lat: 41.3870, lng: 2.1701 }, // Plaza Catalunya
-    timezone: "Europe/Madrid",
-    locale: "es-ES",
-    parentMetroAreaIds: ["es.barcelona-area-metro"],
-  },
-
-  // ===========================================================================
-  // BRASIL
-  // ===========================================================================
-  {
-    id: "br.sao-paulo",
-    country: "BR",
-    displayName: "São Paulo",
-    boundingBox: { swLat: -23.911, swLng: -46.984, neLat: -23.195, neLng: -46.185 },
-    defaultMapCenter: { lat: -23.5505, lng: -46.6333 }, // Sé/Centro
-    timezone: "America/Sao_Paulo",
-    locale: "pt-BR",
-    parentMetroAreaIds: [],
-  },
-
-  // ===========================================================================
-  // COLOMBIA
-  // ===========================================================================
-  {
-    id: "co.bogota",
-    country: "CO",
-    displayName: "Bogotá D.C.",
-    boundingBox: { swLat: 4.40, swLng: -74.30, neLat: 4.85, neLng: -73.95 },
-    defaultMapCenter: { lat: 4.6097, lng: -74.0817 }, // Plaza Bolívar
-    timezone: "America/Bogota",
-    locale: "es-CO",
-    parentMetroAreaIds: [],
-  },
-
-  // ===========================================================================
-  // FINLANDIA
-  // ===========================================================================
-  {
-    id: "fi.helsinki",
-    country: "FI",
-    displayName: "Helsinki",
-    // HSL cubre Helsinki + Espoo + Vantaa + 9 municipios área metro.
-    boundingBox: { swLat: 60.05, swLng: 24.50, neLat: 60.50, neLng: 25.40 },
-    defaultMapCenter: { lat: 60.1699, lng: 24.9384 }, // Centro Helsinki
-    timezone: "Europe/Helsinki",
-    locale: "fi-FI",
-    parentMetroAreaIds: [],
-  },
-
-  // ===========================================================================
-  // ESTADOS UNIDOS
-  // ===========================================================================
-  {
-    id: "us.minneapolis",
-    country: "US",
-    displayName: "Twin Cities (Minneapolis-Saint Paul)",
-    boundingBox: { swLat: 44.70, swLng: -93.80, neLat: 45.20, neLng: -92.85 },
-    defaultMapCenter: { lat: 44.9778, lng: -93.2650 }, // Downtown Minneapolis
-    timezone: "America/Chicago",
-    locale: "en-US",
-    parentMetroAreaIds: [],
-  },
-
-  // ===========================================================================
-  // AUSTRALIA
-  // ===========================================================================
-  {
-    id: "au.brisbane",
-    country: "AU",
-    displayName: "Brisbane / SE Queensland",
-    // TransLink cubre Brisbane + Gold Coast + Sunshine Coast + Toowoomba.
-    boundingBox: { swLat: -28.30, swLng: 152.50, neLat: -26.40, neLng: 153.55 },
-    defaultMapCenter: { lat: -27.4698, lng: 153.0251 }, // Brisbane CBD
-    timezone: "Australia/Brisbane",
-    locale: "en-AU",
-    parentMetroAreaIds: [],
   },
 ];
 

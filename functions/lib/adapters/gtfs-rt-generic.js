@@ -14,7 +14,7 @@
  * Usa `gtfs-realtime-bindings` oficial (Google + MobilityData).
  *
  * Para feeds NO estándar (custom JSON, PascalCase, schemas propios), usar
- * adapters dedicados con box sanitizador Zod (gcba.js, cm-lisboa.js, etc.).
+ * adapters dedicados con box sanitizador Zod (gcba.js, imm-stm.js, etc.).
  */
 
 const GtfsRealtimeBindings = require("gtfs-realtime-bindings");

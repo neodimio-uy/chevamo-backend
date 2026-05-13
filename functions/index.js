@@ -3090,7 +3090,7 @@ exports.onSupportTicketUpdated = onDocumentUpdated(
 //     "https://us-central1-vamo-dbad6.cloudfunctions.net/runStaticGtfsPipeline?feedId=..."
 //
 // Uso:
-//   GET /runStaticGtfsPipeline?feedId=cm-lisboa-static&strongCascade=1
+//   GET /runStaticGtfsPipeline?feedId=imm-stm-static&strongCascade=1
 //
 // Output:
 //   gs://vamo-dbad6.firebasestorage.app/gtfs-snapshots/{feedId}/latest/snapshot.json.gz
@@ -3197,11 +3197,9 @@ exports.runStaticGtfsPipeline = onRequest(
       const sizeMb = (gzipped.length / 1024 / 1024).toFixed(2);
       const sizeMbBr = (brotlied.length / 1024 / 1024).toFixed(2);
 
-      // Path con date EN LA TZ DE LA CIUDAD (no UTC). Si Lisboa procesa a
-      // las 02:30 local del 29-abril (= 01:30 UTC del 29-abril), el snapshot
-      // queda en `gtfs-snapshots/cm-lisboa-static/2026-04-29/...`. Para Mvd
-      // procesado a 02:30 UY (= 05:30 UTC), también `2026-04-29`. Cada feed
-      // tiene "su" día.
+      // Path con date EN LA TZ DE LA CIUDAD (no UTC). Si Mvd procesa a las
+      // 02:30 UY (= 05:30 UTC del 29-abril), el snapshot queda en
+      // `gtfs-snapshots/imm-stm-static/2026-04-29/...`. Cada feed tiene "su" día.
       const feedTz = require("./lib/feed-timezones");
       const local = feedTz.localTimeForFeed(feedId) || {
         dateLocal: new Date().toISOString().slice(0, 10),

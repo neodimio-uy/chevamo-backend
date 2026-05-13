@@ -10,26 +10,13 @@ const { METRO_AREAS } = require("../metro-areas");
 const { OPERATORS } = require("../operators");
 
 describe("transport-graph.resolveJurisdiction", () => {
-  test("Mvd resuelve con IMM + MTOP + larga distancia", () => {
+  test("Mvd resuelve con IMM", () => {
     const r = tg.resolveJurisdiction("uy.mvd");
     expect(r).not.toBeNull();
     expect(r.jurisdiction.id).toBe("uy.mvd");
     expect(r.metroAreas.map((m) => m.id)).toContain("uy.mvd-area-metro");
-    expect(r.nationalNetworks.map((n) => n.id)).toContain("uy.long-distance");
     const opIds = r.operators.map((o) => o.id);
     expect(opIds).toContain("imm");
-    expect(opIds).toContain("mtop");
-  });
-
-  test("Canelones hereda STM urbano vía metroArea (líneas D9/G/710 cubren Canelones)", () => {
-    const r = tg.resolveJurisdiction("uy.canelones");
-    expect(r).not.toBeNull();
-    const busUrban = r.modes.find(
-      (m) => m.mode === "bus" && m.service === "urban"
-    );
-    expect(busUrban).toBeDefined();
-    expect(busUrban.dataMode).toBe("official");
-    expect(busUrban.operators).toContain("imm");
   });
 
   test("CABA tiene bus + subte + bike (todos GCBA)", () => {
@@ -57,13 +44,11 @@ describe("transport-graph.resolveJurisdiction", () => {
 });
 
 describe("transport-graph.resolveMetroArea", () => {
-  test("Mvd Area Metro tiene 3 jurisdicciones", () => {
+  test("Mvd Area Metro tiene Mvd", () => {
     const r = tg.resolveMetroArea("uy.mvd-area-metro");
     expect(r).not.toBeNull();
     const jids = r.jurisdictions.map((j) => j.id);
-    expect(jids).toEqual(
-      expect.arrayContaining(["uy.mvd", "uy.canelones", "uy.san-jose"])
-    );
+    expect(jids).toEqual(expect.arrayContaining(["uy.mvd"]));
   });
 
   test("AMBA tiene CABA + GBA", () => {
@@ -85,10 +70,10 @@ describe("transport-graph.resolveLocation", () => {
     expect(r.jurisdiction.id).toBe("uy.mvd");
   });
 
-  test("Sol (Madrid) → es.madrid", () => {
-    const r = tg.resolveLocation(40.4168, -3.7038);
+  test("Obelisco (CABA) → ar.caba", () => {
+    const r = tg.resolveLocation(-34.6037, -58.3816);
     expect(r).not.toBeNull();
-    expect(r.jurisdiction.id).toBe("es.madrid");
+    expect(r.jurisdiction.id).toBe("ar.caba");
   });
 
   test("Coord en oceano → null", () => {
@@ -97,40 +82,11 @@ describe("transport-graph.resolveLocation", () => {
   });
 });
 
-describe("transport-graph.deriveModes", () => {
-  test("multi-operator merge eleva dataMode (staticOnly + communityOnly → staticOnly)", () => {
-    // Madrid tiene CRTM (staticOnly) + EMT (communityOnly) para bus.urban
-    const r = tg.resolveJurisdiction("es.madrid");
-    const busUrban = r.modes.find(
-      (m) => m.mode === "bus" && m.service === "urban"
-    );
-    expect(busUrban).toBeDefined();
-    expect(busUrban.dataMode).toBe("staticOnly");
-    expect(busUrban.operators.sort()).toEqual(["crtm", "emt-madrid"].sort());
-  });
-
-  test("operators del mismo feed quedan deduped", () => {
-    const r = tg.resolveJurisdiction("uy.mvd");
-    // bus.suburban está en IMM (RT) + MTOP (static). dataMode merge oficial > staticOnly
-    const busSub = r.modes.find(
-      (m) => m.mode === "bus" && m.service === "suburban"
-    );
-    expect(busSub.dataMode).toBe("official");
-    expect(busSub.operators.sort()).toEqual(["imm", "mtop"].sort());
-  });
-});
-
 describe("transport-graph.getActiveFeedsForJurisdictionMode", () => {
   test("Mvd bus.urban devuelve feed RT imm-stm", () => {
     const feeds = tg.getActiveFeedsForJurisdictionMode("uy.mvd", "bus", "urban");
     expect(feeds.length).toBeGreaterThan(0);
     expect(feeds[0].adapterId).toBe("imm-stm");
-  });
-
-  test("Madrid bus.urban devuelve [] (no hay RT, solo staticOnly)", () => {
-    const feeds = tg.getActiveFeedsForJurisdictionMode("es.madrid", "bus", "urban");
-    // CRTM y EMT no tienen adapterId RT — solo staticFeedId
-    expect(feeds.length).toBe(0);
   });
 
   test("CABA bus devuelve gcba-vehicles-simple", () => {
