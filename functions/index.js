@@ -2865,7 +2865,7 @@ exports.onSharedTripStatusChanged = onDocumentUpdated(
 // =============================================================================
 //
 // Tickets en `support_tickets/{ticketId}` con array embedded `replies[]`.
-// Schema en `Vamo/Models/SupportTicket.swift` y `mvd-proxy/admin/src/lib/...`.
+// Schema en `Vamo/Models/SupportTicket.swift` y `chevamo-admin/src/lib/extended-types.ts`.
 //
 // Mecanismo de notificación al ADMIN:
 //   1. Activity event (`activity_events`) → el dashboard tiene NotificationBell
