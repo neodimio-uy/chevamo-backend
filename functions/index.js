@@ -1892,6 +1892,39 @@ exports.api = onRequest({
     return ok(res, ack(), { source: "async" });
   }
 
+  // ── POST /activity/heartbeat — el cliente avisa que sigue vivo ──
+  //
+  // El cron `pushLiveActivityUpdates` lee `lastSeenAt` para detectar LAs
+  // huérfanas (cliente force-quit / crashed). Sin heartbeat, después de
+  // ORPHAN_THRESHOLD_MIN el cron manda push `end` en vez de `update`,
+  // limpiando la LA fantasma de la lock screen del user.
+  if (url === "/activity/heartbeat" && req.method === "POST") {
+    if (!req.auth?.uid) {
+      return fail(res, "UNAUTHORIZED", "Falta idToken");
+    }
+    const { activityId } = req.body || {};
+    if (!activityId) return fail(res, "INVALID_REQUEST", "Falta activityId");
+    try {
+      const ref = db.collection("live_activity_tokens").doc(activityId);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        // No-op: si la LA no está registrada en backend, el ping es ruido.
+        return ok(res, ack(), { source: "computed" });
+      }
+      const ownerUid = snap.data()?.ownerUid;
+      if (ownerUid && ownerUid !== req.auth.uid) {
+        return fail(res, "FORBIDDEN", "No sos el dueño de esta actividad");
+      }
+      await ref.update({
+        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return ok(res, ack(), { source: "computed" });
+    } catch (e) {
+      logger.error(`/activity/heartbeat error: ${e.message}`);
+      return fail(res, "INTERNAL_ERROR");
+    }
+  }
+
   // ── POST /activity/deregister ──
   // Fail-closed: solo el dueño puede desregistrar su Live Activity.
   if (url === "/activity/deregister" && req.method === "POST") {
@@ -2195,6 +2228,16 @@ function buildApnsJwt(keyPem) {
   });
 }
 
+// Si una LA no recibe heartbeat del cliente en este tiempo, asumimos que
+// el cliente fue force-killed / crashed y la marcamos huérfana. En vez de
+// pushear `update` para mantenerla viva, pusheamos `end` para que la LA
+// desaparezca de la lock screen del usuario.
+const LA_ORPHAN_THRESHOLD_MS = 10 * 60 * 1000;   // 10 min sin heartbeat
+// Timeout absoluto: aún si el cliente sigue mandando heartbeats, ninguna
+// LA debería sobrevivir más de 3 horas. Cubre casos donde el cliente quedó
+// en background colgado mandando pings pero el user nunca terminó el viaje.
+const LA_MAX_LIFETIME_MS = 3 * 60 * 60 * 1000;   // 3h desde createdAt
+
 exports.pushLiveActivityUpdates = onSchedule(
   { schedule: "every 1 minutes", memory: "256MiB", timeoutSeconds: 30, secrets: [apnsKey] },
   async () => {
@@ -2213,42 +2256,73 @@ exports.pushLiveActivityUpdates = onSchedule(
       return;
     }
 
-    // Fetch fresh bus data for the push payload
-    // The content-state must match TripActivityAttributes.ContentState
-    // For now, send a heartbeat that keeps the activity alive
-    const timestamp = Math.floor(Date.now() / 1000);
+    const now = Date.now();
+    const timestamp = Math.floor(now / 1000);
 
     for (const doc of tokens.docs) {
-      const { pushToken } = doc.data();
+      const data = doc.data();
+      const { pushToken } = data;
       if (!pushToken) continue;
 
-      try {
-        const payload = JSON.stringify({
-          aps: {
-            timestamp,
-            event: "update",
-            "content-state": {
-              // Minimal heartbeat — keeps the activity from going stale
-              // The app will fill real data when it comes to foreground
-              stepKind: "bus",
-              headline: "Actualizando...",
-              detailLine: "",
-              lineNumber: "",
-              lineColorHex: "",
-              company: "",
-              arrivalTime: "",
-              stepRemainingMin: 0,
-              stepProgress: 0,
-              currentStepIndex: 0,
-              totalSteps: 1,
-            },
-            "alert": {
-              title: "Vamo",
-              body: "Tu viaje se está actualizando"
-            }
-          }
-        });
+      // Detectar huérfana: cliente no pinea hace >ORPHAN_THRESHOLD, O la
+      // LA está corriendo hace más de MAX_LIFETIME desde createdAt.
+      const lastSeen = data.lastSeenAt?.toMillis?.() ?? data.createdAt?.toMillis?.() ?? now;
+      const createdAt = data.createdAt?.toMillis?.() ?? now;
+      const orphanByHeartbeat = (now - lastSeen) > LA_ORPHAN_THRESHOLD_MS;
+      const orphanByLifetime = (now - createdAt) > LA_MAX_LIFETIME_MS;
+      const isOrphan = orphanByHeartbeat || orphanByLifetime;
 
+      // Payload: si es huérfana, push `end` (Apple cierra la LA en el
+      // device aunque la app esté force-killed). Si no, `update` con
+      // heartbeat mínimo para que la app la llene cuando vuelva foreground.
+      const payload = isOrphan
+        ? JSON.stringify({
+            aps: {
+              timestamp,
+              event: "end",
+              "dismissal-date": timestamp,   // dismiss inmediato
+              "content-state": {
+                stepKind: "arrived",
+                headline: "Viaje finalizado",
+                detailLine: "",
+                lineNumber: "",
+                lineColorHex: "",
+                company: "",
+                arrivalTime: "",
+                stepRemainingMin: 0,
+                stepProgress: 1,
+                currentStepIndex: 1,
+                totalSteps: 1,
+              },
+            }
+          })
+        : JSON.stringify({
+            aps: {
+              timestamp,
+              event: "update",
+              "content-state": {
+                // Minimal heartbeat — keeps the activity from going stale
+                // The app will fill real data when it comes to foreground
+                stepKind: "bus",
+                headline: "Actualizando...",
+                detailLine: "",
+                lineNumber: "",
+                lineColorHex: "",
+                company: "",
+                arrivalTime: "",
+                stepRemainingMin: 0,
+                stepProgress: 0,
+                currentStepIndex: 0,
+                totalSteps: 1,
+              },
+              "alert": {
+                title: "Vamo",
+                body: "Tu viaje se está actualizando"
+              }
+            }
+          });
+
+      try {
         const response = await axios.post(
           `https://api.push.apple.com/3/device/${pushToken}`,
           payload,
@@ -2263,7 +2337,13 @@ exports.pushLiveActivityUpdates = onSchedule(
             timeout: 5000,
           }
         );
-        logger.info(`Push sent to activity ${doc.id}: ${response.status}`);
+        if (isOrphan) {
+          await doc.ref.update({ active: false });
+          const reason = orphanByLifetime ? "lifetime>3h" : "heartbeat>10min";
+          logger.info(`Ended orphan LA ${doc.id} (${reason}): ${response.status}`);
+        } else {
+          logger.info(`Push sent to activity ${doc.id}: ${response.status}`);
+        }
       } catch (e) {
         const status = e.response?.status;
         if (status === 410) {
@@ -3349,11 +3429,18 @@ exports.onAsyncWrite = onMessagePublished(
         case "activity-register": {
           const { docId, pushToken, activityId, ownerUid } = payload;
           if (!docId || !pushToken || !ownerUid) return;
+          // createdAt + lastSeenAt: usados por pushLiveActivityUpdates para
+          // detectar LAs huérfanas (cliente force-killed). createdAt es el
+          // ancla del timeout absoluto (3h); lastSeenAt se refresca con
+          // cada /activity/heartbeat del cliente vivo.
+          const now = admin.firestore.FieldValue.serverTimestamp();
           await db.collection("live_activity_tokens").doc(docId).set({
             pushToken,
             activityId: activityId || "",
             ownerUid,
-            registeredAt: admin.firestore.FieldValue.serverTimestamp(),
+            registeredAt: now,
+            createdAt: now,
+            lastSeenAt: now,
             active: true,
           }, { merge: true });
           break;
