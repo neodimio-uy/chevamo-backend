@@ -38,19 +38,6 @@ const METRO_AREAS = [
     timezone: "America/Montevideo",
     locale: "es-UY",
   },
-
-  // ===========================================================================
-  // ARGENTINA
-  // ===========================================================================
-  {
-    id: "ar.amba",
-    displayName: "Área Metropolitana de Buenos Aires",
-    jurisdictionIds: ["ar.caba", "ar.gba"],
-    boundingBox: { swLat: -35.30, swLng: -59.00, neLat: -34.30, neLng: -57.70 },
-    defaultMapCenter: { lat: -34.6037, lng: -58.3816 }, // Obelisco
-    timezone: "America/Argentina/Buenos_Aires",
-    locale: "es-AR",
-  },
 ];
 
 const METRO_AREAS_BY_ID = Object.fromEntries(METRO_AREAS.map((m) => [m.id, m]));

@@ -31,28 +31,6 @@
 
 const STATIC_FEEDS = [
   {
-    feedId:              "gcba-colectivos-static",
-    cityIds:             ["ar.amba"],
-    sourceUrl:           "https://cdn.buenosaires.gob.ar/datosabiertos/datasets/transporte-y-obras-publicas/colectivos-gtfs/colectivos-gtfs.zip",
-    bbox:                { swLat: -35.30, swLng: -59.00, neLat: -34.30, neLng: -57.70 },
-    refreshIntervalDays: 14,
-    license:             "GCBA — Datos Abiertos Buenos Aires",
-    notes:               "GTFS estático colectivos CABA. Cubre solo CABA (no AMBA entera — provincia BsAs requiere otros feeds). Complementa el feed RT `gcba-vehicles-simple` que sí cubre AMBA.",
-  },
-  {
-    feedId:              "gcba-subte-static",
-    cityIds:             ["ar.amba"],
-    // Endpoint protegido por API gateway de GCBA. El runStaticGtfsPipeline
-    // detecta `requiresAuth === "BA_TRANSPORT"` e inyecta `client_id` +
-    // `client_secret` desde Secret Manager antes de pasar al pipeline.
-    sourceUrl:           "https://apitransporte.buenosaires.gob.ar/subtes/feed-gtfs",
-    requiresAuth:        "BA_TRANSPORT",
-    bbox:                { swLat: -34.72, swLng: -58.55, neLat: -34.50, neLng: -58.30 },
-    refreshIntervalDays: 30,
-    license:             "GP-SBASE — Subterráneos de Buenos Aires SE — CC-BY-2.5-AR",
-    notes:               "GTFS estático SBASE: 9 routes (A/B/C/D/E/H + Premetro), 707 stops, pathways, transfers, fares. Vigente hasta 2026-12-31. ZIP ~48KB (snapshot final esperado <100KB gzip).",
-  },
-  {
     feedId:              "imm-stm-static",
     cityIds:             ["uy.mvd-area-metro"],
     // GTFS oficial IMM Mvd urbano (STM-MVD). URL pública oficial pendiente con

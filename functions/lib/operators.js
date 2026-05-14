@@ -42,40 +42,6 @@ const OPERATORS = [
       metroAreas: ["uy.mvd-area-metro"],
     },
   },
-
-  // ===========================================================================
-  // ARGENTINA
-  // ===========================================================================
-  {
-    id: "gcba",
-    displayName: "GCBA — Gobierno de la Ciudad de Buenos Aires",
-    country: "AR",
-    kind: "public-agency",
-    color: { palette: "yellow", reservedFor: "official" },
-    license: "Datos abiertos GCBA",
-    contact: "https://buenosaires.gob.ar/",
-    feeds: [
-      // Bus colectivos: JSON enriquecido AMBA (CABA + 24 partidos GBA).
-      // Sin coverage propio: usa el del operator (AMBA completo).
-      { mode: "bus", service: "urban", dataMode: "official", adapterId: "gcba-vehicles-simple" },
-      // Subte: forecast JSON custom (sin GPS — predicciones de arribo). Pendiente.
-      // Coverage propio: solo CABA (subte no llega a GBA).
-      {
-        mode: "subte", service: "urban", dataMode: "official", adapterId: "gcba-subte-forecast",
-        coverage: { jurisdictions: ["ar.caba"] },
-      },
-      // Ecobici GBFS: docking stations (no `TransitVehicle` — modelo BikeStation pendiente).
-      // Coverage propio: solo CABA (Ecobici opera dentro de la capital).
-      {
-        mode: "bike", service: "urban", dataMode: "official", adapterId: "gcba-ecobici-gbfs",
-        coverage: { jurisdictions: ["ar.caba"] },
-      },
-    ],
-    coverage: {
-      jurisdictions: ["ar.caba", "ar.gba"],
-      metroAreas: ["ar.amba"],
-    },
-  },
 ];
 
 const OPERATORS_BY_ID = Object.fromEntries(OPERATORS.map((o) => [o.id, o]));

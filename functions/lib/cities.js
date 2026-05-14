@@ -45,36 +45,6 @@ const CITIES = [
       taxi: { dataMode: "communityOnly" },
     },
   },
-
-  // ===========================================================================
-  // ARGENTINA
-  // ===========================================================================
-  {
-    id: "ar.amba",
-    country: "AR",
-    zone: "amba",
-    displayName: "Área Metropolitana de Buenos Aires",
-    // CABA + 24 partidos GBA + La Plata + Brandsen
-    boundingBox: { swLat: -35.30, swLng: -59.00, neLat: -34.30, neLng: -57.70 },
-    defaultMapCenter: { lat: -34.6037, lng: -58.3816 }, // Obelisco
-    timezone: "America/Argentina/Buenos_Aires",
-    locale: "es-AR",
-    modes: {
-      bus: {
-        dataMode: "official",
-        feed: "gcba-vehicles-simple",
-      },
-      subte: {
-        dataMode: "official",
-        feed: "gcba-subte-forecast",
-      },
-      bike: {
-        dataMode: "official",
-        feed: "gcba-ecobici-gbfs",
-      },
-      // Taxi AMBA: pendiente — primero Mvd, después se suma.
-    },
-  },
 ];
 
 const CITIES_BY_ID = Object.fromEntries(CITIES.map((c) => [c.id, c]));

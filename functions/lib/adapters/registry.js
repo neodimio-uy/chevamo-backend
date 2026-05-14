@@ -10,8 +10,8 @@
  * Sumar feed nuevo:
  *   - Si es GTFS-RT estándar protobuf → usar `gtfs-rt-generic.js`, basta agregar
  *     URL + auth en este archivo
- *   - Si es JSON custom (GCBA Simple, etc.) → adapter dedicado en
- *     `lib/adapters/<feed>.js` con su Zod schema
+ *   - Si es JSON custom → adapter dedicado en `lib/adapters/<feed>.js` con su
+ *     Zod schema
  *
  * Mantenemos box sanitizador para feeds custom — confianza zero en lo que
  * viene del backend externo (puede cambiar shape sin avisar).
@@ -19,7 +19,6 @@
 
 const axios = require("axios");
 const gtfsRt = require("./gtfs-rt-generic");
-const gcba = require("./gcba");
 const immStm = require("./imm-stm");
 
 const IMM_BASE = "https://api.montevideo.gub.uy/api/transportepublico";
@@ -27,28 +26,6 @@ const IMM_BASE = "https://api.montevideo.gub.uy/api/transportepublico";
 // ─────────────────────────────────────────────────────────────────────────────
 // Adapter implementations por feed
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * GCBA `/colectivos/vehiclePositionsSimple` — JSON enriquecido, AMBA AR.
- *
- * Auth: client_id + client_secret en query string (Secret Manager).
- *
- * @param {object} opts
- * @param {string} opts.clientId - BA_TRANSPORT_CLIENT_ID
- * @param {string} opts.clientSecret - BA_TRANSPORT_CLIENT_SECRET
- * @param {object} opts.ctx - { cityId, mode, feedSource }
- */
-async function fetchGcbaVehiclesSimple({ clientId, clientSecret, ctx }) {
-  if (!clientId || !clientSecret) {
-    throw new Error("GCBA credentials not configured");
-  }
-  const url = `https://apitransporte.buenosaires.gob.ar/colectivos/vehiclePositionsSimple?client_id=${clientId}&client_secret=${clientSecret}`;
-  const r = await axios.get(url, { timeout: 12_000, responseType: "json" });
-  if (!Array.isArray(r.data)) {
-    throw new Error("GCBA response is not an array");
-  }
-  return gcba.mapFeedToVehicles(r.data, ctx);
-}
 
 /**
  * IMM/STM Montevideo — `/buses` autenticado con OAuth + fallback stm-online.
@@ -127,23 +104,12 @@ async function fetchGtfsRtVehicles({ url, headers = {}, ctx }) {
  */
 async function dispatch(feedId, ctx, secrets = {}) {
   switch (feedId) {
-    case "gcba-vehicles-simple":
-      return fetchGcbaVehiclesSimple({
-        clientId: secrets.baTransportClientId,
-        clientSecret: secrets.baTransportClientSecret,
-        ctx,
-      });
-
     case "imm-stm":
       return fetchImmStmVehicles({
         getImmToken:        secrets.getImmToken,
         fetchStmOnlineRaw:  secrets.fetchStmOnlineRaw,
         ctx,
       });
-
-    case "gcba-subte-forecast":
-    case "gcba-ecobici-gbfs":
-      throw new Error(`Feed "${feedId}" pendiente de implementación en registry`);
 
     default:
       throw new Error(`Feed desconocido: "${feedId}"`);
@@ -153,7 +119,6 @@ async function dispatch(feedId, ctx, secrets = {}) {
 module.exports = {
   dispatch,
   // exports para testing directo:
-  fetchGcbaVehiclesSimple,
   fetchGtfsRtVehicles,
   fetchImmStmVehicles,
 };

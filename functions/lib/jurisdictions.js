@@ -36,31 +36,6 @@ const JURISDICTIONS = [
     locale: "es-UY",
     parentMetroAreaIds: ["uy.mvd-area-metro"],
   },
-
-  // ===========================================================================
-  // ARGENTINA
-  // ===========================================================================
-  {
-    id: "ar.caba",
-    country: "AR",
-    displayName: "Ciudad Autónoma de Buenos Aires",
-    boundingBox: { swLat: -34.71, swLng: -58.55, neLat: -34.53, neLng: -58.33 },
-    defaultMapCenter: { lat: -34.6037, lng: -58.3816 }, // Obelisco
-    timezone: "America/Argentina/Buenos_Aires",
-    locale: "es-AR",
-    parentMetroAreaIds: ["ar.amba"],
-  },
-  {
-    id: "ar.gba",
-    country: "AR",
-    displayName: "Gran Buenos Aires",
-    // 24 partidos GBA + La Plata + Brandsen
-    boundingBox: { swLat: -35.30, swLng: -59.00, neLat: -34.30, neLng: -57.70 },
-    defaultMapCenter: { lat: -34.7, lng: -58.5 }, // promedio partidos GBA
-    timezone: "America/Argentina/Buenos_Aires",
-    locale: "es-AR",
-    parentMetroAreaIds: ["ar.amba"],
-  },
 ];
 
 const JURISDICTIONS_BY_ID = Object.fromEntries(JURISDICTIONS.map((j) => [j.id, j]));

@@ -84,8 +84,6 @@ const transportGraph = require("./lib/transport-graph");
 // Adapters dedicados para feeds que no encajan en TransitVehicle:
 //   - Subte forecast: arrival predictions sin GPS (TripUpdate-like)
 //   - Ecobici GBFS:   estaciones de docking (BikeStation-like)
-const gcbaSubte   = require("./lib/adapters/gcba-subte");
-const gcbaEcobici = require("./lib/adapters/gcba-ecobici");
 
 // Modo Taxi/Remis (Vamo marketplace propio — Etapa 1 stubs 2026-04-27)
 const rideSchemas = require("./lib/ride-hailing/schemas");
@@ -103,9 +101,11 @@ setGlobalOptions({ region: "southamerica-east1" });
 // Google Maps API key desde Secret Manager — nunca en código
 const googleMapsKey = defineSecret("GOOGLE_MAPS_KEY");
 const immClientSecret = defineSecret("IMM_CLIENT_SECRET");
-// Credenciales GCBA (Buenos Aires) — Secret Manager
-const baTransportClientId     = defineSecret("BA_TRANSPORT_CLIENT_ID");
-const baTransportClientSecret = defineSecret("BA_TRANSPORT_CLIENT_SECRET");
+// Credenciales BA (GCBA / Buenos Aires) — los secrets siguen en Secret Manager
+// con sus valores; sólo eliminamos el código que los consumía. Si en el
+// futuro se reactiva la integración BA, basta con re-declarar acá:
+//   const baTransportClientId     = defineSecret("BA_TRANSPORT_CLIENT_ID");
+//   const baTransportClientSecret = defineSecret("BA_TRANSPORT_CLIENT_SECRET");
 // Mercado Pago Access Tokens — uno por país. Si no se setean en Secret
 // Manager, el wrapper opera en MODO MOCK (devuelve {status:"approved"} sin
 // cobrar). Esto permite preview visual antes de generar credenciales reales.
@@ -292,10 +292,6 @@ const airQualityCache = new RequestCache(60 * 60 * 1000);
 // Cache de /vehicles por (cityId+mode+service). TTL corto: dato realtime
 // pero compartido entre clientes que hagan polling cerca en tiempo.
 const vehiclesCache = new RequestCache(10_000); // 10s
-// Caches específicos para feeds dedicados (Subte 10s, Ecobici 30s — la
-// info de bicis no cambia tan rápido como buses).
-const subteForecastCache = new RequestCache(10_000);
-const bikeStationsCache  = new RequestCache(30_000);
 
 // ─────────────────────────────────────────────────────────────────
 // Circuit breaker para la API de la IMM
@@ -632,7 +628,6 @@ exports.api = onRequest({
   vpcConnectorEgressSettings: "PRIVATE_RANGES_ONLY", // solo tráfico interno (Redis), internet sigue por gateway
   secrets: [
     googleMapsKey, immClientSecret,
-    baTransportClientId, baTransportClientSecret,
     mpAccessTokenUY, mpAccessTokenAR, mpAccessTokenBR, mpWebhookSecret,
   ],
 }, async (req, res) => {
@@ -1279,90 +1274,6 @@ exports.api = onRequest({
     }
   }
 
-  // ── GET /subte-forecast?jurisdictionId=ar.caba ─── (Fase 3 ext — 2026-04-27)
-  //
-  // Devuelve TripUpdates del Subte de Buenos Aires. Formato custom no-GTFS
-  // (arrival predictions por estación, sin GPS de vehículos). Cliente iOS
-  // muestra arrivals por estación, no en mapa.
-  //
-  // Solo disponible para `jurisdictionId=ar.caba` por ahora (Subte solo CABA).
-  if (url === "/subte-forecast" && req.method === "GET") {
-    const jurisdictionId = (req.query.jurisdictionId || "").toString().toLowerCase();
-    if (jurisdictionId !== "ar.caba") {
-      return fail(res, "INVALID_REQUEST", "Subte solo disponible para jurisdictionId=ar.caba");
-    }
-    try {
-      const entry = await subteForecastCache.dedupe("default", async () => {
-        const r = await gcbaSubte.fetchSubteForecast({
-          clientId:     baTransportClientId.value(),
-          clientSecret: baTransportClientSecret.value(),
-        });
-        if (r.rejectedCount > 0) {
-          logger.info(`/subte-forecast: ${r.rejectedCount} entries rechazadas por schema`);
-        }
-        return {
-          tripUpdates:    r.tripUpdates,
-          jurisdictionId,
-          feedTimestamp:  r.feedTimestamp,
-        };
-      });
-      return sendCachedWrapped(req, res, entry, {
-        source:   "gcba-subte-forecast",
-        dataMode: "official",
-      });
-    } catch (e) {
-      logger.error(`/subte-forecast error: ${e.message}`);
-      const stale = subteForecastCache.getStale("default");
-      if (stale) {
-        return sendCachedWrapped(req, res, stale, {
-          source: "gcba-subte-forecast", dataMode: "official", stale: true,
-        });
-      }
-      return fail(res, "FEED_UNAVAILABLE", "Subte forecast no disponible");
-    }
-  }
-
-  // ── GET /bike-stations?jurisdictionId=ar.caba ─── (Fase 3 ext)
-  //
-  // Estaciones de Ecobici AMBA (GBFS). Combina stationInformation (estática)
-  // + stationStatus (live: bikes/docks disponibles). Solo CABA por ahora.
-  if (url === "/bike-stations" && req.method === "GET") {
-    const jurisdictionId = (req.query.jurisdictionId || "").toString().toLowerCase();
-    if (jurisdictionId !== "ar.caba") {
-      return fail(res, "INVALID_REQUEST", "Bike stations solo disponible para jurisdictionId=ar.caba");
-    }
-    try {
-      const entry = await bikeStationsCache.dedupe("default", async () => {
-        const r = await gcbaEcobici.fetchEcobiciStations({
-          clientId:     baTransportClientId.value(),
-          clientSecret: baTransportClientSecret.value(),
-        });
-        if (r.rejectedCount > 0) {
-          logger.info(`/bike-stations: ${r.rejectedCount} estaciones rechazadas por schema`);
-        }
-        return {
-          stations:       r.stations,
-          jurisdictionId,
-          systemId:       "ecobici-amba",
-          feedTimestamp:  r.feedTimestamp,
-        };
-      });
-      return sendCachedWrapped(req, res, entry, {
-        source:   "gcba-ecobici-gbfs",
-        dataMode: "official",
-      });
-    } catch (e) {
-      logger.error(`/bike-stations error: ${e.message}`);
-      const stale = bikeStationsCache.getStale("default");
-      if (stale) {
-        return sendCachedWrapped(req, res, stale, {
-          source: "gcba-ecobici-gbfs", dataMode: "official", stale: true,
-        });
-      }
-      return fail(res, "FEED_UNAVAILABLE", "Ecobici no disponible");
-    }
-  }
-
   // ── GET /vehicles?country=X&zone=Y&mode=Z[&service=W] ── (Milestone 1 Foundation)
   // ── GET /vehicles?jurisdictionId=X&mode=Z[&service=W] ─── (Fase 2 — modelo nuevo)
   //
@@ -1498,8 +1409,6 @@ exports.api = onRequest({
     try {
       const entry = await vehiclesCache.dedupe(cacheKey, async () => {
         const result = await adapterRegistry.dispatch(modeConfig.feed, ctx, {
-          baTransportClientId:     baTransportClientId.value(),
-          baTransportClientSecret: baTransportClientSecret.value(),
           // Helpers para imm-stm: comparte el token cache singleton de /buses
           // y la normalización de stm-online (incluye EMPRESA_NAMES mapping).
           getImmToken:             getToken,
@@ -3188,7 +3097,6 @@ exports.runStaticGtfsPipeline = onRequest(
     cpu:            4,                // CPUs adicionales aceleran parse de stop_times grandes
     cors:           false,            // admin-only, no se llama desde browser cliente
     invoker:        "private",        // bloquea allUsers; IAM enforced al deployar
-    secrets:        [baTransportClientId, baTransportClientSecret], // inyectados a feeds GCBA con `requiresAuth: "BA_TRANSPORT"`
   },
   async (req, res) => {
     if (req.method !== "GET" && req.method !== "POST") {
@@ -3214,34 +3122,6 @@ exports.runStaticGtfsPipeline = onRequest(
     let feedConfig = staticFeeds.getStaticFeed(feedId);
     if (!feedConfig) {
       return fail(res, "INVALID_REQUEST", `feedId desconocido: ${feedId}`);
-    }
-
-    // Inyección de credenciales para feeds protegidos por la API gateway
-    // de GCBA (`gcba-subte-static`, futuros `gcba-trenes-static`, etc.).
-    // El feed config trae `requiresAuth: "BA_TRANSPORT"` y la sourceUrl
-    // base; acá la mutamos para agregar `?client_id=X&client_secret=Y`
-    // antes de pasarla al pipeline (que hace axios.get directo).
-    if (feedConfig.requiresAuth === "BA_TRANSPORT") {
-      // `.trim()` por si los secrets se crearon con un trailing newline (caso
-      // típico al pegar valores con `gcloud secrets create --data-file=...`).
-      // Sin trim, el `\n` se manda al upstream y el proxy GCBA rechaza con 401.
-      const cid  = (baTransportClientId.value() || "").trim();
-      const csec = (baTransportClientSecret.value() || "").trim();
-      if (!cid || !csec) {
-        logger.error(`runStaticGtfsPipeline ${feedId}: BA_TRANSPORT secrets no configurados`);
-        return fail(res, "MISCONFIGURED", "BA_TRANSPORT credentials missing");
-      }
-      const sep = feedConfig.sourceUrl.includes("?") ? "&" : "?";
-      // SIN `encodeURIComponent` — el proxy GCBA Mulesoft espera los valores
-      // crudos (validado: el curl directo `?client_id=$CID&client_secret=$CSEC`
-      // sin encode devuelve 200, mientras que con encode sobre algunos chars
-      // base64 (`+`, `/`, `=`) el upstream rechaza con 401.
-      // `fetchUrl` se usa solo para el axios.get del pipeline. `sourceUrl`
-      // queda intacta para no exponer credenciales en meta.json / snapshot.json.
-      feedConfig = {
-        ...feedConfig,
-        fetchUrl: `${feedConfig.sourceUrl}${sep}client_id=${cid}&client_secret=${csec}`,
-      };
     }
 
     logger.info(`runStaticGtfsPipeline: ${feedId} arrancando (strongCascade=${strongCascade})`);

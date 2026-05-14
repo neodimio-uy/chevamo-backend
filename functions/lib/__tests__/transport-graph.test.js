@@ -19,24 +19,6 @@ describe("transport-graph.resolveJurisdiction", () => {
     expect(opIds).toContain("imm");
   });
 
-  test("CABA tiene bus + subte + bike (todos GCBA)", () => {
-    const r = tg.resolveJurisdiction("ar.caba");
-    expect(r).not.toBeNull();
-    const modeNames = r.modes.map((m) => m.mode);
-    expect(modeNames).toContain("bus");
-    expect(modeNames).toContain("subte");
-    expect(modeNames).toContain("bike");
-  });
-
-  test("GBA tiene SOLO bus (subte y bike restringidos a CABA por feed.coverage)", () => {
-    const r = tg.resolveJurisdiction("ar.gba");
-    expect(r).not.toBeNull();
-    const modeNames = r.modes.map((m) => m.mode);
-    expect(modeNames).toContain("bus");
-    expect(modeNames).not.toContain("subte");
-    expect(modeNames).not.toContain("bike");
-  });
-
   test("jurisdictionId desconocido devuelve null", () => {
     expect(tg.resolveJurisdiction("xx.unknown")).toBeNull();
     expect(tg.resolveJurisdiction("")).toBeNull();
@@ -51,13 +33,6 @@ describe("transport-graph.resolveMetroArea", () => {
     expect(jids).toEqual(expect.arrayContaining(["uy.mvd"]));
   });
 
-  test("AMBA tiene CABA + GBA", () => {
-    const r = tg.resolveMetroArea("ar.amba");
-    expect(r).not.toBeNull();
-    const jids = r.jurisdictions.map((j) => j.id);
-    expect(jids).toEqual(expect.arrayContaining(["ar.caba", "ar.gba"]));
-  });
-
   test("metroAreaId desconocido devuelve null", () => {
     expect(tg.resolveMetroArea("xx.unknown")).toBeNull();
   });
@@ -68,12 +43,6 @@ describe("transport-graph.resolveLocation", () => {
     const r = tg.resolveLocation(-34.9058, -56.1913);
     expect(r).not.toBeNull();
     expect(r.jurisdiction.id).toBe("uy.mvd");
-  });
-
-  test("Obelisco (CABA) → ar.caba", () => {
-    const r = tg.resolveLocation(-34.6037, -58.3816);
-    expect(r).not.toBeNull();
-    expect(r.jurisdiction.id).toBe("ar.caba");
   });
 
   test("Coord en oceano → null", () => {
@@ -87,16 +56,6 @@ describe("transport-graph.getActiveFeedsForJurisdictionMode", () => {
     const feeds = tg.getActiveFeedsForJurisdictionMode("uy.mvd", "bus", "urban");
     expect(feeds.length).toBeGreaterThan(0);
     expect(feeds[0].adapterId).toBe("imm-stm");
-  });
-
-  test("CABA bus devuelve gcba-vehicles-simple", () => {
-    const feeds = tg.getActiveFeedsForJurisdictionMode("ar.caba", "bus", "urban");
-    expect(feeds.some((f) => f.adapterId === "gcba-vehicles-simple")).toBe(true);
-  });
-
-  test("GBA subte devuelve [] (subte solo CABA)", () => {
-    const feeds = tg.getActiveFeedsForJurisdictionMode("ar.gba", "subte", "urban");
-    expect(feeds).toEqual([]);
   });
 });
 
