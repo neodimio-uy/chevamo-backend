@@ -2517,9 +2517,12 @@ async function syncSbaseAlertsToFirestore(clientId, clientSecret) {
   return { fetched: alerts.length, inserted, updated, resolved };
 }
 
+// Cadencia 15 min (no 1 min) hasta resolver el bloqueador de IP egress
+// shared rate-limit en GCBA — ver [[project-vamo-sbase-alerts-blocker]].
+// Cuando se whitelisteen IPs estáticas via Cloud NAT (v1.1), bajar a 1 min.
 exports.syncSbaseAlerts = onSchedule(
   {
-    schedule: "every 1 minutes",
+    schedule: "every 15 minutes",
     memory: "256MiB",
     timeoutSeconds: 60,
     secrets: [baTransportClientId, baTransportClientSecret],
