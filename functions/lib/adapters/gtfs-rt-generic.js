@@ -134,10 +134,159 @@ function mapFeedToVehicles(buffer, ctx) {
   return { vehicles, feedTimestamp };
 }
 
+// Mapping GTFS-RT Alert.Cause enum → string canónico Vamo `Incident.kind`.
+// Tabla oficial: https://gtfs.org/realtime/reference/#enum-cause
+const ALERT_CAUSE_MAP = {
+  1: "unknown",         // UNKNOWN_CAUSE
+  2: "other",           // OTHER_CAUSE
+  3: "technical",       // TECHNICAL_PROBLEM
+  4: "strike",          // STRIKE
+  5: "demonstration",   // DEMONSTRATION
+  6: "accident",        // ACCIDENT
+  7: "holiday",         // HOLIDAY
+  8: "weather",         // WEATHER
+  9: "maintenance",     // MAINTENANCE
+  10: "construction",   // CONSTRUCTION
+  11: "police",         // POLICE_ACTIVITY
+  12: "medical",        // MEDICAL_EMERGENCY
+};
+
+// Mapping GTFS-RT Alert.Effect enum → string canónico Vamo (informativo;
+// se persiste como `effect` para que el cliente decida cómo renderear).
+// Tabla oficial: https://gtfs.org/realtime/reference/#enum-effect
+const ALERT_EFFECT_MAP = {
+  1: "no_service",
+  2: "reduced_service",
+  3: "significant_delays",
+  4: "detour",
+  5: "additional_service",
+  6: "modified_service",
+  7: "other_effect",
+  8: "unknown_effect",
+  9: "stop_moved",
+  10: "no_effect",
+  11: "accessibility_issue",
+};
+
+// Mapping GTFS-RT SeverityLevel enum → string canónico Vamo.
+// Tabla oficial: https://gtfs.org/realtime/reference/#enum-severitylevel
+// `Incident.severity` del schema admin Vamo: low/medium/high/critical.
+// SEVERE → high (no critical, reservamos critical para incidents que cierran
+// líneas enteras por horas — el admin puede sobreescribir si corresponde).
+const ALERT_SEVERITY_MAP = {
+  1: "low",        // UNKNOWN_SEVERITY (informativo)
+  2: "low",        // INFO
+  3: "medium",     // WARNING
+  4: "high",       // SEVERE
+};
+
+/**
+ * Extrae el primer texto de una `TranslatedString` GTFS-RT. La spec permite
+ * múltiples translations por idioma; tomamos español si está, sino el primero.
+ *
+ * @param {object|null} ts - TranslatedString del proto
+ * @param {string} preferLang - código de idioma (default "es")
+ * @returns {string} texto extraído o "" si no hay
+ */
+function extractText(ts, preferLang = "es") {
+  if (!ts || !Array.isArray(ts.translation) || ts.translation.length === 0) return "";
+  const preferred = ts.translation.find((t) => (t.language || "").toLowerCase().startsWith(preferLang));
+  return (preferred?.text || ts.translation[0].text || "").trim();
+}
+
+/**
+ * Convierte un timestamp protobuf (puede ser number o Long) a UNIX seconds.
+ * Devuelve null si no es válido.
+ */
+function pbTimestamp(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return v > 0 ? v : null;
+  if (typeof v.toNumber === "function") {
+    const n = v.toNumber();
+    return n > 0 ? n : null;
+  }
+  return null;
+}
+
+/**
+ * Mapea una `entity.alert` GTFS-RT al schema canónico Vamo Incident.
+ * Devuelve null si la entity no tiene `alert` (es vehicle o trip_update).
+ *
+ * @param {object} entity - feedMessage.entity[i]
+ * @param {object} ctx - { cityId, source } (ej `{ cityId: "ar.bue-caba", source: "sbase" }`)
+ * @returns {object|null} Incident canonical o null
+ */
+function mapAlertEntity(entity, ctx) {
+  if (!entity || !entity.alert) return null;
+  const a = entity.alert;
+
+  // Periodo activo: tomamos el primero. La spec permite múltiples ventanas
+  // discontinuas pero raramente se usan; el cliente solo necesita "vigente
+  // o no" y `start`/`end` para mostrar duración.
+  const period = (a.active_period && a.active_period[0]) || {};
+  const startedAt = pbTimestamp(period.start) ?? Math.floor(Date.now() / 1000);
+  const endsAt = pbTimestamp(period.end);
+
+  // Líneas y estaciones afectadas — extraemos solo IDs, el cliente resuelve
+  // el display via su catálogo local.
+  const affectedLines = [];
+  const affectedStations = [];
+  for (const sel of a.informed_entity || []) {
+    if (sel.route_id) affectedLines.push(sel.route_id);
+    if (sel.stop_id) affectedStations.push(sel.stop_id);
+  }
+
+  return {
+    source: ctx.source,
+    externalId: String(entity.id || ""),
+    cityId: ctx.cityId,
+    kind: ALERT_CAUSE_MAP[a.cause] || "unknown",
+    effect: ALERT_EFFECT_MAP[a.effect] || "unknown_effect",
+    severity: ALERT_SEVERITY_MAP[a.severity_level] || "medium",
+    title: extractText(a.header_text),
+    description: extractText(a.description_text),
+    affectedLines: [...new Set(affectedLines)],
+    affectedStations: [...new Set(affectedStations)],
+    startedAt,
+    endsAt,
+    status: "active",
+    fetchedAt: Math.floor(Date.now() / 1000),
+  };
+}
+
+/**
+ * Mapea un FeedMessage de alerts a la lista canónica. Filtra entities que no
+ * sean alerts (vehicles, trip_updates) y normaliza.
+ *
+ * @param {Buffer|ArrayBuffer} buffer - feed protobuf crudo
+ * @param {object} ctx - { cityId, source }
+ * @returns {{ alerts: Array, feedTimestamp: number|null }}
+ */
+function mapFeedToAlerts(buffer, ctx) {
+  const feed = decodeFeed(buffer);
+  const entities = feed.entity || [];
+  const alerts = entities
+    .map((e) => mapAlertEntity(e, ctx))
+    .filter((a) => a !== null);
+
+  const feedTimestamp = feed.header?.timestamp
+    ? (typeof feed.header.timestamp === "number"
+        ? feed.header.timestamp
+        : feed.header.timestamp.toNumber())
+    : null;
+
+  return { alerts, feedTimestamp };
+}
+
 module.exports = {
   decodeFeed,
   mapVehicleEntity,
   mapFeedToVehicles,
+  mapAlertEntity,
+  mapFeedToAlerts,
   STATUS_MAP,
   CONGESTION_MAP,
+  ALERT_CAUSE_MAP,
+  ALERT_EFFECT_MAP,
+  ALERT_SEVERITY_MAP,
 };

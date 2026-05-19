@@ -101,11 +101,11 @@ setGlobalOptions({ region: "southamerica-east1" });
 // Google Maps API key desde Secret Manager — nunca en código
 const googleMapsKey = defineSecret("GOOGLE_MAPS_KEY");
 const immClientSecret = defineSecret("IMM_CLIENT_SECRET");
-// Credenciales BA (GCBA / Buenos Aires) — los secrets siguen en Secret Manager
-// con sus valores; sólo eliminamos el código que los consumía. Si en el
-// futuro se reactiva la integración BA, basta con re-declarar acá:
-//   const baTransportClientId     = defineSecret("BA_TRANSPORT_CLIENT_ID");
-//   const baTransportClientSecret = defineSecret("BA_TRANSPORT_CLIENT_SECRET");
+// Credenciales BA (GCBA / Buenos Aires Transporte). Re-activadas 2026-05-19
+// para el adapter de service alerts del subte (`gcba-subte-alerts`), que polea
+// `apitransporte.buenosaires.gob.ar/subtes/serviceAlerts` (GTFS-RT protobuf).
+const baTransportClientId     = defineSecret("BA_TRANSPORT_CLIENT_ID");
+const baTransportClientSecret = defineSecret("BA_TRANSPORT_CLIENT_SECRET");
 // Mercado Pago Access Tokens — uno por país. Si no se setean en Secret
 // Manager, el wrapper opera en MODO MOCK (devuelve {status:"approved"} sin
 // cobrar). Esto permite preview visual antes de generar credenciales reales.
@@ -574,6 +574,11 @@ function transformDirections(googleData) {
 // Caché de Directions — rutas son determinísticas (mismo origen/destino = misma ruta)
 // TTL 24h ahorra miles de dólares/mes a escala
 const directionsCache = new RequestCache(86_400_000); // 24h
+
+// Cache simple para `/status/incidents` — no usa RequestCache (no necesita
+// dedupe por key, es siempre la misma query). 30s TTL alineado con el cron
+// SBASE que escribe cada 60s — el público ve a lo sumo 30s de delay.
+let statusIncidentsCache = null;
 
 // Background warming del cache de buses.
 // Con minInstances=1 la Cloud Function queda warm permanentemente; aprovechamos
@@ -1781,6 +1786,65 @@ exports.api = onRequest({
     return ok(res, parsed.data, { source: "computed" });
   }
 
+  // ── GET /status/incidents — público, sin auth ──
+  //
+  // Endpoint que consume `status.chevamo.com.uy` para mostrar incidents
+  // activos en el banner del status público. Lee Firestore `incidents`
+  // filtrando `status in ['active', 'monitoring']` + `publishable: true`
+  // y sanitiza la respuesta: NO expone `description` interno, `raw`,
+  // `adminNotes` ni cualquier campo que el admin use para workflow
+  // interno. Solo emite info que el público puede ver.
+  //
+  // Cache 30s (in-memory) — el sync cron escribe cada minuto, alcanza
+  // con devolver lo mismo durante 30s para amortizar reads.
+  if (url === "/status/incidents" && req.method === "GET") {
+    const STATUS_INCIDENTS_TTL = 30 * 1000;
+    const cached = statusIncidentsCache;
+    const now = Date.now();
+    if (cached && (now - cached.fetchedAt) < STATUS_INCIDENTS_TTL) {
+      res.setHeader("Cache-Control", "public, max-age=30");
+      return ok(res, cached.payload, { source: "cache" });
+    }
+
+    try {
+      const snap = await db
+        .collection("incidents")
+        .where("status", "in", ["active", "monitoring"])
+        .where("publishable", "==", true)
+        .orderBy("startedAt", "desc")
+        .limit(50)
+        .get();
+
+      const incidents = snap.docs.map((doc) => {
+        const d = doc.data();
+        // Whitelist explícito de campos públicos. Cualquier campo nuevo
+        // que se agregue al schema del admin NO se filtra acá por defecto
+        // — hay que sumarlo a propósito si es seguro.
+        return {
+          id: doc.id,
+          source: d.source || "manual",         // "sbase" | "manual"
+          cityId: d.cityId || null,
+          kind: d.kind || "unknown",
+          effect: d.effect || null,
+          severity: d.severity || "medium",
+          title: d.title || "",
+          affectedLines: Array.isArray(d.affectedLines) ? d.affectedLines : [],
+          startedAt: d.startedAt || null,
+          endsAt: d.endsAt || null,
+          status: d.status || "active",
+        };
+      });
+
+      const payload = { incidents, total: incidents.length };
+      statusIncidentsCache = { payload, fetchedAt: now };
+      res.setHeader("Cache-Control", "public, max-age=30");
+      return ok(res, payload, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/status/incidents failed: ${e.message}`);
+      return fail(res, "INTERNAL_ERROR", "No se pudieron listar incidentes");
+    }
+  }
+
   // ── POST /activity/register — push token de Live Activity ──
   // Fail-closed desde 2026-04-26: requiere idToken válido. iOS lo manda
   // siempre desde TripManager.sendPushTokenToBackend.
@@ -2290,6 +2354,150 @@ exports.cleanupStaleCommunityBuses = onSchedule(
     await batch.commit();
 
     logger.info(`Cleanup: deleted ${snapshot.size} stale community docs`);
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────
+// Cron: SBASE service alerts → Firestore `incidents` (source: "sbase")
+// ─────────────────────────────────────────────────────────────────
+//
+// CABA expone GTFS-RT service alerts oficiales del subte en
+// `apitransporte.buenosaires.gob.ar/subtes/serviceAlerts` (auth con
+// `client_id`/`client_secret` GCBA Transporte). Este cron lo polea cada
+// minuto, parsea protobuf y reconcilia con la colección Firestore
+// `incidents` filtrando por `source == "sbase"`:
+//
+//   - alert en feed Y en Firestore → update (refresh `fetchedAt`,
+//     `endsAt`, contenido si cambió)
+//   - alert en feed Y NO en Firestore → insert (status: "active")
+//   - alert NO en feed Y en Firestore activa → mark `status: "resolved"`
+//
+// Para Mvd no hay feed equivalente — los incidents Mvd los escribe el
+// admin manualmente con `source: "manual"` y este cron NO los toca.
+
+const SBASE_ALERTS_URL = "https://apitransporte.buenosaires.gob.ar/subtes/serviceAlerts";
+
+async function syncSbaseAlertsToFirestore(clientId, clientSecret) {
+  const gtfsRt = require("./lib/adapters/gtfs-rt-generic");
+
+  // 1. Fetch feed con auth GCBA. axios responseType arraybuffer → Buffer
+  //    para que protobuf.decode lo lea sin conversión.
+  const url = `${SBASE_ALERTS_URL}?client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`;
+  let buffer;
+  try {
+    const res = await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 10_000,
+      headers: { "User-Agent": "Vamo/1.0 (status sync)" },
+    });
+    buffer = res.data;
+  } catch (e) {
+    logger.error(`SBASE alerts fetch failed: ${e.message}`);
+    return { fetched: 0, inserted: 0, updated: 0, resolved: 0, error: e.message };
+  }
+
+  // 2. Parsear protobuf → alerts canónicos
+  let alerts = [];
+  try {
+    const out = gtfsRt.mapFeedToAlerts(buffer, {
+      cityId: "ar.bue-caba",
+      source: "sbase",
+    });
+    alerts = out.alerts;
+  } catch (e) {
+    logger.error(`SBASE alerts parse failed: ${e.message}`);
+    return { fetched: 0, inserted: 0, updated: 0, resolved: 0, error: e.message };
+  }
+
+  const feedById = new Map(alerts.map((a) => [a.externalId, a]));
+
+  // 3. Leer incidents activos de la fuente sbase
+  const existingSnap = await db
+    .collection("incidents")
+    .where("source", "==", "sbase")
+    .where("status", "in", ["active", "monitoring"])
+    .get();
+
+  const existingByExternalId = new Map();
+  existingSnap.docs.forEach((doc) => {
+    const data = doc.data();
+    if (data.externalId) existingByExternalId.set(data.externalId, doc);
+  });
+
+  const batch = db.batch();
+  let inserted = 0, updated = 0, resolved = 0;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  // 4a. Insert / update por externalId presente en el feed
+  for (const [externalId, alert] of feedById.entries()) {
+    const existing = existingByExternalId.get(externalId);
+    if (existing) {
+      // Update: refresh timestamps + contenido si cambió
+      batch.update(existing.ref, {
+        kind: alert.kind,
+        effect: alert.effect,
+        severity: alert.severity,
+        title: alert.title,
+        description: alert.description,
+        affectedLines: alert.affectedLines,
+        affectedStations: alert.affectedStations,
+        endsAt: alert.endsAt,
+        fetchedAt: now,
+        updatedAt: now,
+      });
+      updated++;
+    } else {
+      // Insert nuevo. Doc ID compuesto por `sbase:<externalId>` para que
+      // sea idempotente — si el cron corre dos veces simultáneo no crea
+      // duplicados (Firestore set con merge:false).
+      const docId = `sbase:${externalId}`;
+      batch.set(db.collection("incidents").doc(docId), {
+        ...alert,
+        status: "active",
+        publishable: true,
+        createdAt: now,
+        updatedAt: now,
+        fetchedAt: now,
+      });
+      inserted++;
+    }
+  }
+
+  // 4b. Resolved: existed en Firestore activa pero NO está en el feed
+  for (const [externalId, doc] of existingByExternalId.entries()) {
+    if (!feedById.has(externalId)) {
+      batch.update(doc.ref, {
+        status: "resolved",
+        resolvedAt: now,
+        updatedAt: now,
+      });
+      resolved++;
+    }
+  }
+
+  if (inserted + updated + resolved > 0) {
+    await batch.commit();
+  }
+
+  logger.info(`SBASE sync: feed=${alerts.length} inserted=${inserted} updated=${updated} resolved=${resolved}`);
+  return { fetched: alerts.length, inserted, updated, resolved };
+}
+
+exports.syncSbaseAlerts = onSchedule(
+  {
+    schedule: "every 1 minutes",
+    memory: "256MiB",
+    timeoutSeconds: 60,
+    secrets: [baTransportClientId, baTransportClientSecret],
+  },
+  async () => {
+    const clientId = baTransportClientId.value();
+    const clientSecret = baTransportClientSecret.value();
+    if (!clientId || !clientSecret) {
+      logger.warn("SBASE sync skipped: BA_TRANSPORT credentials not configured");
+      return;
+    }
+    await syncSbaseAlertsToFirestore(clientId, clientSecret);
   }
 );
 
