@@ -150,7 +150,7 @@ const EMPRESA_NAMES = {
   32: "SAN ANTONIO", 39: "ZEBALLOS HERMANOS", 41: "RUTAS DEL NORTE",
 };
 
-const BUSES_CACHE_TTL   = 10_000;   // 10s — dato fresco pero compartido entre requests
+const BUSES_CACHE_TTL   = 5_000;    // 5s — bajado de 10s en Unif 10 (2026-05-17): IMM publica cada ~10s pero la cadena IMM→backend→cliente acumulaba ≥20s de stale. Half-TTL acerca la edad media a la real.
 const UPCOMING_CACHE_TTL = 10_000;  // 10s por parada
 const STOPS_CACHE_TTL   = 86_400_000; // 24h
 const RATE_LIMIT_WINDOW = 60_000;   // 1 minuto
