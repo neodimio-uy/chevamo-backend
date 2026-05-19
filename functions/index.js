@@ -2388,20 +2388,46 @@ const SBASE_ALERTS_URL = "https://apitransporte.buenosaires.gob.ar/subtes/servic
 async function syncSbaseAlertsToFirestore(clientId, clientSecret) {
   const gtfsRt = require("./lib/adapters/gtfs-rt-generic");
 
-  // 1. Fetch feed con auth GCBA. axios responseType arraybuffer → Buffer
-  //    para que protobuf.decode lo lea sin conversión.
+  // 1. Fetch feed con auth GCBA. El upstream SBASE es intermitente:
+  //    devuelve 200/401/500 aleatoriamente con SSLHandshakeException del
+  //    proxy GCBA (issue conocido upstream — NO es nuestra cred). Retry
+  //    exponencial con jitter para amortiguar; si los 3 intentos fallan,
+  //    log info (no error) y skip — el próximo tick del cron reintenta.
   const url = `${SBASE_ALERTS_URL}?client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`;
   let buffer;
-  try {
-    const res = await axios.get(url, {
-      responseType: "arraybuffer",
-      timeout: 10_000,
-      headers: { "User-Agent": "Vamo/1.0 (status sync)" },
-    });
-    buffer = res.data;
-  } catch (e) {
-    logger.error(`SBASE alerts fetch failed: ${e.message}`);
-    return { fetched: 0, inserted: 0, updated: 0, resolved: 0, error: e.message };
+  let lastError = null;
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await axios.get(url, {
+        responseType: "arraybuffer",
+        timeout: 10_000,
+        headers: { "User-Agent": "Vamo/1.0 (status sync)" },
+      });
+      buffer = res.data;
+      lastError = null;
+      break;
+    } catch (e) {
+      lastError = e;
+      // Retry exponencial con jitter: ~500ms, ~1500ms entre intentos.
+      // No reintentamos en 4xx con código distinto a 401/429 — son
+      // errores nuestros (mal armado URL, cred revocada permanente).
+      const status = e.response?.status;
+      const transient = status === 401 || status === 429 || status >= 500 || !status;
+      if (attempt < MAX_ATTEMPTS && transient) {
+        const backoff = 500 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
+        await new Promise((r) => setTimeout(r, backoff));
+        continue;
+      }
+      break;
+    }
+  }
+  if (lastError) {
+    // Log info en lugar de error — los blips intermitentes upstream son
+    // esperados y no necesitan alertar. Si pasa minutos seguidos, los
+    // métricas de Cloud Monitoring lo van a detectar como gap.
+    logger.info(`SBASE alerts fetch skipped (upstream): ${lastError.message}`);
+    return { fetched: 0, inserted: 0, updated: 0, resolved: 0, skipped: true };
   }
 
   // 2. Parsear protobuf → alerts canónicos
