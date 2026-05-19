@@ -1807,15 +1807,19 @@ exports.api = onRequest({
     }
 
     try {
-      const snap = await db
-        .collection("incidents")
-        .where("status", "in", ["active", "monitoring"])
-        .where("publishable", "==", true)
-        .orderBy("startedAt", "desc")
-        .limit(50)
-        .get();
+      // 2 queries pequeñas en paralelo (una por source) usando el índice
+      // compuesto (source, status). Mergeamos + ordenamos + filtramos
+      // `publishable` en código. Evita un índice (publishable, status,
+      // startedAt) que tarda mucho en crearse cuando la colección crece.
+      const snap = await Promise.all([
+        db.collection("incidents").where("source", "==", "sbase").where("status", "==", "active").get(),
+        db.collection("incidents").where("source", "==", "sbase").where("status", "==", "monitoring").get(),
+        db.collection("incidents").where("source", "==", "manual").where("status", "==", "active").get(),
+        db.collection("incidents").where("source", "==", "manual").where("status", "==", "monitoring").get(),
+      ]);
+      const docs = snap.flatMap((s) => s.docs).filter((d) => d.data().publishable === true);
 
-      const incidents = snap.docs.map((doc) => {
+      const incidents = docs.map((doc) => {
         const d = doc.data();
         // Whitelist explícito de campos públicos. Cualquier campo nuevo
         // que se agregue al schema del admin NO se filtra acá por defecto
@@ -1835,7 +1839,11 @@ exports.api = onRequest({
         };
       });
 
-      const payload = { incidents, total: incidents.length };
+      // Sort descending por startedAt (filtramos null al final del array)
+      incidents.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+      const limited = incidents.slice(0, 50);
+
+      const payload = { incidents: limited, total: limited.length };
       statusIncidentsCache = { payload, fetchedAt: now };
       res.setHeader("Cache-Control", "public, max-age=30");
       return ok(res, payload, { source: "firestore" });
