@@ -91,9 +91,13 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // Community buses: cualquiera lee, solo el dueño escribe con validación
+    // Community buses: cualquier user autenticado (incluye anónimos) lee,
+    // solo el dueño escribe con validación. Antes era `if true` lo que
+    // permitía scraping anónimo de patrones de movilidad — el cliente
+    // siempre hace `signInAnonymously()` antes de leer, así que `isAuth()`
+    // no rompe el flujo legítimo (audit P0 Unif 11, 2026-05-19).
     match /community_buses/{docId} {
-      allow read: if true;
+      allow read: if isAuth();
 
       // Create: validar campos requeridos y que el userId coincida.
       // `officialBusId` es opcional — solo se setea desde el flujo
@@ -276,12 +280,20 @@ service cloud.firestore {
       allow create: if false;
     }
 
-    // Invitaciones de contacto: lectura pública por código (cualquiera con
-    // el link puede previsualizar quién invita). Creación: el dueño con
-    // un campo fromUid == auth.uid. Updates: solo el dueño puede setear
-    // `rejected` desde el cliente; el accept lo hace la Cloud Function.
+    // Invitaciones de contacto: lectura por código (cualquiera con el
+    // link puede previsualizar quién invita). Endurecimiento Unif 11
+    // (audit P0):
+    //   1. Separar `get` (un doc por código exacto) de `list` (enumerar
+    //      la colección). Permitimos el get desde Universal Link y
+    //      denegamos list — antes `allow read: if isAuth()` permitía a
+    //      cualquier user autenticado scrapear toda la colección
+    //      (~1M combos con 6 chars).
+    //   2. Bug del update: `!resource.data.acceptedBy` siempre era falsy
+    //      (el campo no existe en el modelo, es `acceptedAt`) → el
+    //      chequeo pasaba siempre. Corregido a `acceptedAt == null`.
     match /contact_invitations/{code} {
-      allow read: if isAuth();
+      allow get: if isAuth();
+      allow list: if false;
       allow create: if isAuth()
         && request.resource.data.fromUid == request.auth.uid
         && request.resource.data.keys().hasAll(['fromUid', 'fromDisplayName', 'createdAt', 'expiresAt'])
@@ -294,9 +306,10 @@ service cloud.firestore {
       // Update: cualquier auth user puede marcar `rejected` (el sender
       // cancela su invitación O el receptor la rechaza desde la pantalla
       // de invitación entrante). Solo se permite mutar `rejected` y
-      // `acceptedAt`; el accept real se hace via Cloud Function.
+      // `acceptedAt`; el accept real se hace via Cloud Function que
+      // bypasea rules con admin SDK.
       allow update: if isAuth()
-        && !resource.data.acceptedBy
+        && resource.data.acceptedAt == null
         && resource.data.fromUid != null
         && request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['rejected', 'acceptedAt']);
@@ -336,12 +349,15 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Códigos de referido: read público (cualquiera con el código puede
-    // ver a quién pertenece para canjearlo), create solo del dueño con su
-    // ownerUid, update solo via Cloud Function (cliente no puede mutar
-    // signups directamente — eso lo hace `redeemReferralCode`).
+    // Códigos de referido: lookup por código exacto desde el link de
+    // referido. Endurecimiento Unif 11 (audit P0): separamos `get`
+    // (autenticado, sirve para canjear via Universal Link) de `list`
+    // (enumeración masiva, no aplica al flow — antes permitía a
+    // cualquier user listar la colección entera y descubrir codes
+    // ajenos).
     match /referral_codes/{code} {
-      allow read: if isAuth();
+      allow get: if isAuth();
+      allow list: if false;
       allow create: if isAuth()
         && request.resource.data.ownerUid == request.auth.uid
         && request.resource.data.keys().hasAll(['ownerUid', 'createdAt', 'signups'])
