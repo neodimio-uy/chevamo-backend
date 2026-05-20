@@ -165,12 +165,44 @@ const RETRY_ATTEMPTS    = 3;
 const RETRY_BASE_MS     = 500;      // 500ms, 1s, 2s
 
 // ─────────────────────────────────────────────────────────────────
-// GTFS estático (cargado una vez por instancia al cold start)
+// GTFS estático
 // ─────────────────────────────────────────────────────────────────
+//
+// `stopLines` (~136 KB) se carga eager: lookups muy frecuentes, costo
+// negligible.
+//
+// `stopSchedules` (~24 MB) se carga LAZY la primera vez que un endpoint
+// pide horarios. Antes bloqueaba el cold start ~1-2s parseando JSON
+// gigante; con lazy, la primera request en frío es ~300ms y la primera
+// pide-de-horarios paga el cost (~1-2s) una vez por instancia. Como el
+// polling principal `/buses` NO toca schedules, el path crítico no se
+// ve afectado por el cold start.
 
-const stopLines     = JSON.parse(fs.readFileSync(path.join(__dirname, "stop-lines.json"), "utf8"));
-const stopSchedules = JSON.parse(fs.readFileSync(path.join(__dirname, "stop-schedules.json"), "utf8"));
-logger.info(`GTFS loaded: ${Object.keys(stopLines).length} stops, ${Object.keys(stopSchedules).length} with schedules`);
+const stopLines = JSON.parse(fs.readFileSync(path.join(__dirname, "stop-lines.json"), "utf8"));
+logger.info(`GTFS stopLines loaded: ${Object.keys(stopLines).length} stops`);
+
+let _stopSchedulesCache = null;
+let _stopSchedulesPromise = null;
+
+function getStopSchedules() {
+  if (_stopSchedulesCache) return _stopSchedulesCache;
+  if (_stopSchedulesPromise) return _stopSchedulesPromise;
+
+  _stopSchedulesPromise = (async () => {
+    const start = Date.now();
+    const data = await fs.promises.readFile(
+      path.join(__dirname, "stop-schedules.json"),
+      "utf8"
+    );
+    _stopSchedulesCache = JSON.parse(data);
+    const ms = Date.now() - start;
+    logger.info(`GTFS stopSchedules loaded LAZY: ${Object.keys(_stopSchedulesCache).length} entries in ${ms}ms`);
+    _stopSchedulesPromise = null;
+    return _stopSchedulesCache;
+  })();
+
+  return _stopSchedulesPromise;
+}
 
 // ─────────────────────────────────────────────────────────────────
 // Token cache (compartido dentro de la instancia)
@@ -1479,10 +1511,17 @@ exports.api = onRequest({
     const linesParam = req.query.lines;
     if (!linesParam) return fail(res, "INVALID_REQUEST", "Falta parámetro 'lines'");
 
-    const linesList = linesParam.split(",").map(l => l.trim()).filter(Boolean);
-    if (linesList.length === 0) return ok(res, [], { source: "computed" });
+    // Zod input validation — anti-DoS (`?lines=` con 100k entries no
+    // gasta CPU del backend; rechazo con 400). Codigos válidos: alfanum,
+    // max 8 chars cada uno, max 20 por request.
+    const rawList = linesParam.split(",").map(l => l.trim()).filter(Boolean);
+    const inputParse = schemas.BusesByLinesInputSchema.safeParse({ lines: rawList });
+    if (!inputParse.success) {
+      return fail(res, "INVALID_REQUEST", "Parámetro 'lines' inválido (max 20, alfanum, 1-8 chars c/u)");
+    }
+    const linesList = inputParse.data.lines;
 
-    const cacheKey = linesList.sort().join(",");
+    const cacheKey = linesList.slice().sort().join(",");
 
     try {
       // Primero intentar filtrar desde el cache general de /buses si está fresco
@@ -1576,7 +1615,8 @@ exports.api = onRequest({
   const schedulesMatch = url.match(/^\/busstops\/(\d+)\/schedules$/);
   if (schedulesMatch && req.method === "GET") {
     const id = schedulesMatch[1];
-    const schedules = stopSchedules[id];
+    const allSchedules = await getStopSchedules();
+    const schedules = allSchedules[id];
     if (!schedules) return ok(res, {}, { source: "gtfs" });
 
     // GTFS usa hora local Uruguay (UTC-3). El servidor corre en us-central1,
@@ -1691,6 +1731,13 @@ exports.api = onRequest({
     const placeId = req.query.placeId;
     if (!placeId) return fail(res, "INVALID_REQUEST", "Falta placeId");
 
+    // Zod: bloquea path traversal / URL injection en el placeId que va
+    // directo al path de Google Places. Google IDs son `[A-Za-z0-9_-]+`.
+    const inputParse = schemas.PlacesDetailsInputSchema.safeParse({ placeId });
+    if (!inputParse.success) {
+      return fail(res, "INVALID_REQUEST", "placeId con formato inválido");
+    }
+
     try {
       const r = await axios.get(`${GOOGLE_PLACES_NEW_BASE}/places/${placeId}`, {
         headers: {
@@ -1724,11 +1771,21 @@ exports.api = onRequest({
 
   // ── POST /directions ── (migrado)
   if (url === "/directions" && req.method === "POST") {
-    const { fromLat, fromLng, toLat, toLng } = req.body || {};
-    if (!fromLat || !fromLng || !toLat || !toLng) {
-      return fail(res, "INVALID_REQUEST", "Faltan coordenadas");
+    // Zod: tipos numéricos enforced + bounds amplios lat/lng antes del
+    // chequeo geo `inBoundsUY` más estricto. Sin esto, parseFloat("xyz")
+    // pasaba `NaN` que el chequeo `!fromLat` (falsy en 0) no detectaba.
+    const inputParse = schemas.DirectionsInputSchema.safeParse({
+      fromLat: Number(req.body?.fromLat),
+      fromLng: Number(req.body?.fromLng),
+      toLat:   Number(req.body?.toLat),
+      toLng:   Number(req.body?.toLng),
+      mode:    req.body?.mode,
+    });
+    if (!inputParse.success) {
+      return fail(res, "INVALID_REQUEST", "Body /directions inválido (coords numéricas + lat/lng en rango)");
     }
-    if (!inBoundsUY(Number(fromLat), Number(fromLng)) || !inBoundsUY(Number(toLat), Number(toLng))) {
+    const { fromLat, fromLng, toLat, toLng } = inputParse.data;
+    if (!inBoundsUY(fromLat, fromLng) || !inBoundsUY(toLat, toLng)) {
       return fail(res, "INVALID_REQUEST", "Coordenadas fuera de rango");
     }
 
@@ -1769,7 +1826,9 @@ exports.api = onRequest({
   if (url === "/health") {
     const raw = {
       stops: Object.keys(stopLines).length,
-      schedules: Object.keys(stopSchedules).length,
+      // schedules es lazy-loaded; reporta 0 hasta que se haya cargado en
+      // esta instancia, después el conteo real. Health debe ser O(1).
+      schedules: _stopSchedulesCache ? Object.keys(_stopSchedulesCache).length : 0,
       circuit: circuitBreaker.state,
       circuitFailures: circuitBreaker.failures,
       busesCache: busesCache.get("all") ? "hit" : "miss",

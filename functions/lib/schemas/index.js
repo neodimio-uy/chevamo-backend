@@ -16,4 +16,5 @@ module.exports = {
   ...require("./weather"),
   ...require("./airQuality"),
   ...require("./feeds/canonical-vehicle"),
+  ...require("./inputs"),
 };
