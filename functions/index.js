@@ -1627,6 +1627,12 @@ exports.api = onRequest({
 
     const result = {};
     Object.entries(schedules).forEach(([line, times]) => {
+      // Dedupe — el GTFS del STM emite el mismo timestamp 3 veces (uno por
+      // service_id: días hábiles + sábado + domingo). El preprocesador
+      // (`process-schedules.js`) los concatena tal cual; si no dedupeamos,
+      // el cliente muestra "próximo bus: 01:04, 01:04, 01:04" en vez de
+      // 3 horarios distintos. Bug reportado 2026-05-21.
+      const seen = new Set();
       const upcoming = times
         .map(t => {
           const parts = t.split(":");
@@ -1634,6 +1640,11 @@ exports.api = onRequest({
           return { time: t, totalMinutes };
         })
         .filter(t => t.totalMinutes > currentMinutes)
+        .filter(t => {
+          if (seen.has(t.time)) return false;
+          seen.add(t.time);
+          return true;
+        })
         .slice(0, 3)
         .map(t => t.time);
       if (upcoming.length > 0) result[line] = upcoming;
