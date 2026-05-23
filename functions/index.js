@@ -2794,10 +2794,29 @@ exports.recordBusCount = onSchedule(
         timeout: 10_000,
       });
       const { valid } = validateList(schemas.BusSchema, r.data, "/cron:recordBusCount");
-      const count = valid.length;
 
-      const now = new Date();
-      const docId = String(Math.floor(now.getTime() / 1000));
+      // Filtro fantasma: coherente con el filtro client-side de iOS (`Bus.isStaleGhost`,
+      // umbral 90s). Sin esto, el count infla con GPS colgados / equipos apagados que
+      // siguen apareciendo en el feed IMM pero el user NO ve en el mapa. Para la
+      // gráfica pública de chevamo.com.uy queremos "buses CIRCULANDO", no
+      // "buses en el feed crudo".
+      //
+      // El IMM envía timestamp con offset sin minutos (`-03` en vez de `-03:00`),
+      // formato que Node.js V8 NO parsea según ISO 8601 estricto y retorna NaN.
+      // Normalizamos `-NN`/`+NN` a `-NN:00`/`+NN:00` antes de Date.parse.
+      const nowMs = Date.now();
+      const live = valid.filter(b => {
+        if (!b.timestamp || typeof b.timestamp !== "string") return false;
+        const normalized = b.timestamp.replace(/([+-]\d{2})$/, "$1:00");
+        const ts = new Date(normalized).getTime();
+        if (!Number.isFinite(ts)) return false;
+        return (nowMs - ts) / 1000 <= 90;
+      });
+      const count = live.length;
+      const ghosts = valid.length - count;
+
+      const now = new Date(nowMs);
+      const docId = String(Math.floor(nowMs / 1000));
       await admin.firestore()
         .collection("bus_count_history")
         .doc(docId)
@@ -2806,7 +2825,7 @@ exports.recordBusCount = onSchedule(
           count,
         });
 
-      logger.info(`recordBusCount: ${count} buses (${now.toISOString()})`);
+      logger.info(`recordBusCount: ${count} live buses (${ghosts} ghosts filtered) at ${now.toISOString()}`);
     } catch (e) {
       logger.error(`recordBusCount error: ${e.message}`);
     }
