@@ -324,6 +324,94 @@ const airQualityCache = new RequestCache(60 * 60 * 1000);
 // Cache de /vehicles por (cityId+mode+service). TTL corto: dato realtime
 // pero compartido entre clientes que hagan polling cerca en tiempo.
 const vehiclesCache = new RequestCache(10_000); // 10s
+// Cache de Google Distance Matrix por (busLatRound, busLngRound, stopId).
+// TTL 60s — el tráfico cambia pero no tanto en <1min. Clave redondeada a
+// 3 decimales (~100m) para que buses cercanos al mismo stop compartan key.
+// Namespace `traffic-eta` separa del resto en Redis L2.
+const trafficEtaCache = new RequestCache(60_000, "traffic-eta");
+// Cache para /stats/bus-count. Granularidad 30s — el cron escribe cada
+// 60s, así que un cache 30s amortiza picos de tráfico (gráfica pública
+// en chevamo.com.uy) sin servir data muy obsoleta. Key incluye `hours`
+// porque el downsampling depende de la ventana solicitada.
+const statsBusCountCache = new RequestCache(30_000, "stats-bus-count");
+
+// ─────────────────────────────────────────────────────────────────
+// Google Distance Matrix con tráfico (enriquecimiento del ETA)
+// ─────────────────────────────────────────────────────────────────
+
+/** Redondea coord a ~100m (3 decimales) para agrupar en cache key. */
+function roundCoord(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+/**
+ * Llama Google Distance Matrix con `traffic_model=best_guess` y
+ * `departure_time=now`. Devuelve duración en segundos con tráfico, o `null`
+ * si la respuesta no es OK o se excedió el timeout estricto.
+ *
+ * Timeout strict 500ms: si Google no responde rápido, NO bloqueamos al user
+ * que está esperando el `/upcoming`. La próxima request hits cache (60s TTL)
+ * y devuelve el ETA con tráfico. UX: primer poll sin tráfico, segundo sí.
+ */
+async function fetchGoogleDistanceMatrixEta(busLat, busLng, stopLat, stopLng) {
+  try {
+    const r = await axios.get(
+      "https://maps.googleapis.com/maps/api/distancematrix/json",
+      {
+        params: {
+          origins: `${busLat},${busLng}`,
+          destinations: `${stopLat},${stopLng}`,
+          mode: "driving",
+          departure_time: "now",
+          traffic_model: "best_guess",
+          key: googleMapsKey.value(),
+        },
+        timeout: 500,
+      }
+    );
+    const element = r.data?.rows?.[0]?.elements?.[0];
+    if (!element || element.status !== "OK") return null;
+    return element.duration_in_traffic?.value ?? element.duration?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cache-aware wrapper: chequea L1+L2 antes de llamar Google. Dedupe in-flight
+ * para que 50 requests concurrentes para el mismo par se conviertan en 1.
+ * Devuelve `null` si miss + Google falla/timeout.
+ */
+async function getCachedTrafficEta(busLat, busLng, stopLat, stopLng, stopId) {
+  const key = `${roundCoord(busLat)}:${roundCoord(busLng)}:${stopId}`;
+  const entry = await trafficEtaCache.dedupe(key, async () => {
+    const etaSec = await fetchGoogleDistanceMatrixEta(busLat, busLng, stopLat, stopLng);
+    return { etaSec };
+  });
+  return entry?.data?.etaSec ?? null;
+}
+
+/**
+ * Downsample temporal: agrupa puntos `{t, c}` en buckets de `bucketMs`
+ * milisegundos y devuelve un punto por bucket con `c` promedio (entero).
+ * Buckets vacíos se omiten (no se interpola). Para el gráfico de
+ * /stats/bus-count: granularidad 1min raw para ventanas cortas, 5min para
+ * 24h, 1h para semana. Reduce payload a la web sin perder forma de la curva.
+ */
+function bucketAverage(points, bucketMs) {
+  if (points.length === 0) return [];
+  const buckets = new Map();
+  for (const p of points) {
+    const bucket = Math.floor(p.t / bucketMs) * bucketMs;
+    if (!buckets.has(bucket)) buckets.set(bucket, { sum: 0, count: 0 });
+    const b = buckets.get(bucket);
+    b.sum += p.c;
+    b.count++;
+  }
+  return Array.from(buckets.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([t, b]) => ({ t, c: Math.round(b.sum / b.count) }));
+}
 
 // ─────────────────────────────────────────────────────────────────
 // Circuit breaker para la API de la IMM
@@ -475,11 +563,31 @@ function checkRateLimit(ip) {
   return true;
 }
 
+// Rate limit más estricto para endpoints admin (~10 req/min/IP) que cubre
+// el costo de `requireAdminEmail` (cada call invoca Firebase Admin
+// auth.verifyIdToken, lo cual cuesta cuota y CPU aún con token inválido).
+// Defensa en código antes de Cloud Armor; ambas coexisten.
+const adminRateLimitMap = new Map(); // ip → { count, resetAt }
+const ADMIN_RATE_LIMIT_MAX = 10;
+function checkAdminRateLimit(ip) {
+  const now = Date.now();
+  let entry = adminRateLimitMap.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW };
+    adminRateLimitMap.set(ip, entry);
+  }
+  entry.count++;
+  return entry.count <= ADMIN_RATE_LIMIT_MAX;
+}
+
 // Limpiar entradas expiradas cada 5 minutos
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of rateLimitMap) {
     if (now >= entry.resetAt) rateLimitMap.delete(ip);
+  }
+  for (const [ip, entry] of adminRateLimitMap) {
+    if (now >= entry.resetAt) adminRateLimitMap.delete(ip);
   }
 }, 300_000);
 
@@ -618,6 +726,15 @@ let statusIncidentsCache = null;
 // requests de usuarios siempre leen cache fresco (<500ms) en vez de esperar
 // la IMM (1.5-5s). Ver project_vamo_redesign_master_plan.md → 7a.
 let warmerStarted = false;
+// `firstWarmupPromise` se completa cuando termina la PRIMER corrida del
+// refresh (haya o no llenado la cache). El handler de `/buses` espera esta
+// promesa (con timeout) en cold start para que la primera request no
+// dispare su propio fetch IMM en serial. Mata la ventana de 1-3 min
+// post-deploy donde el user veía "permanente error IMM" hasta calentar.
+// Ver: project_vamo_cache_prewarmer_postdeploy.md
+let firstWarmupDone = false;
+let firstWarmupPromise = null;
+
 function startBackgroundWarmer() {
   if (warmerStarted) return;
   warmerStarted = true;
@@ -650,8 +767,9 @@ function startBackgroundWarmer() {
     }
   };
 
-  // Primera corrida inmediata, luego cada 7s
-  refresh();
+  // Primera corrida explícita, exposada como promesa para que el handler
+  // pueda esperarla en cold start.
+  firstWarmupPromise = refresh().finally(() => { firstWarmupDone = true; });
   setInterval(refresh, 7_000);
 }
 
@@ -664,7 +782,7 @@ exports.api = onRequest({
   vpcConnector: "vamo-connector-saeast",             // acceso a Memorystore Redis en VPC sa-east1
   vpcConnectorEgressSettings: "PRIVATE_RANGES_ONLY", // solo tráfico interno (Redis), internet sigue por gateway
   secrets: [
-    googleMapsKey, immClientSecret,
+    googleMapsKey, immClientSecret, geminiApiKey,
     mpAccessTokenUY, mpAccessTokenAR, mpAccessTokenBR, mpWebhookSecret,
   ],
 }, async (req, res) => {
@@ -690,11 +808,28 @@ exports.api = onRequest({
   // No rechaza requests sin tokens — los endpoints sensibles validan abajo.
   await extractAuth(req);
 
+  // ── /admin/briefing — expuesto via api.chevamo.com.uy para que pase por
+  // el LB + Cloud Armor (rate limit /admin/* dedicado). Comparte lógica con
+  // la función legacy `exports.adminBriefing` mediante `handleAdminBriefing`.
+  if (url === "/admin/briefing") {
+    return handleAdminBriefing(req, res);
+  }
+
   // ── GET /buses ── (migrado al box sanitizador)
   //
   // Pipeline: fuente raw (IMM o stm-online) → validateList(BusSchema) → ok(data, meta).
   // meta.source indica la fuente efectiva, meta.stale indica si venimos de cache stale.
   if (url === "/buses" && req.method === "GET") {
+    // Cold-start guard: en revisión recién deployada el warmer puede estar
+    // todavía corriendo su primera fetch. Esperarla (cap 2s) evita que esta
+    // request haga un fetch IMM paralelo en serial. Si el warmer tarda más
+    // de 2s, fluimos normal y la dedupe abajo absorbe el segundo intento.
+    if (!firstWarmupDone && firstWarmupPromise) {
+      await Promise.race([
+        firstWarmupPromise,
+        new Promise(resolve => setTimeout(resolve, 2000)),
+      ]);
+    }
     // 1. Primary: IMM API (si circuit breaker lo permite)
     if (circuitBreaker.canRequest()) {
       try {
@@ -1572,6 +1707,56 @@ exports.api = onRequest({
     return ok(res, lines, { source: "gtfs" });
   }
 
+  // ── GET /stats/bus-count ── (público, sin auth)
+  //
+  // Histórico de la cantidad de buses circulando en Mvd. Lo escribe el
+  // cron `recordBusCount` cada 1 min. Endpoint pensado para la gráfica
+  // en chevamo.com.uy (showcase del sistema en tiempo real). Cache 30s
+  // amortiza el polling de la landing pública.
+  //
+  // Downsampling según ventana:
+  //   - hours <= 2  → raw 1 min  (max ~120 puntos)
+  //   - hours <= 24 → bucket 5 min (max ~288 puntos)
+  //   - hours <= 168 (semana) → bucket 1 h (max ~168 puntos)
+  //
+  // Si Firestore está vacío (cron no corrió aún o data limpiada), devuelve
+  // array vacío con HTTP 200 — el cliente debe renderear "Sin datos por
+  // ahora" gracefully, no asumir error.
+  if (url.startsWith("/stats/bus-count") && req.method === "GET") {
+    const hoursRaw = parseInt(req.query.hours, 10);
+    const hours = Math.min(Math.max(Number.isFinite(hoursRaw) ? hoursRaw : 24, 1), 168);
+    try {
+      const entry = await statsBusCountCache.dedupe(`hours:${hours}`, async () => {
+        const db = admin.firestore();
+        const cutoff = admin.firestore.Timestamp.fromDate(
+          new Date(Date.now() - hours * 3600 * 1000)
+        );
+        const snapshot = await db
+          .collection("bus_count_history")
+          .where("timestamp", ">=", cutoff)
+          .orderBy("timestamp", "asc")
+          .get();
+        const rawPoints = snapshot.docs.map(d => {
+          const data = d.data();
+          return { t: data.timestamp.toMillis(), c: data.count };
+        });
+        let points;
+        if (hours <= 2) {
+          points = rawPoints;
+        } else if (hours <= 24) {
+          points = bucketAverage(rawPoints, 5 * 60 * 1000);
+        } else {
+          points = bucketAverage(rawPoints, 60 * 60 * 1000);
+        }
+        return { hours, granularity: hours <= 2 ? "1m" : hours <= 24 ? "5m" : "1h", points };
+      });
+      return sendCachedWrapped(req, res, entry, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/stats/bus-count error: ${e.message}`);
+      return fail(res, "STATS_UNAVAILABLE", "No se pudo leer el histórico");
+    }
+  }
+
   // ── GET /busstops/:id/upcoming ── (migrado)
   const upcomingMatch = url.match(/^\/busstops\/(\d+)\/upcoming$/);
   if (upcomingMatch && req.method === "GET") {
@@ -1588,6 +1773,15 @@ exports.api = onRequest({
       return fail(res, "SERVICE_DEGRADED");
     }
 
+    // Opcionalmente, el cliente puede enviar `stopLat`/`stopLng` para que
+    // enriquezcamos cada UpcomingBus con `googleEtaSec` (Google Distance Matrix
+    // con tráfico real). Si no vienen, behavior idéntico al actual — backward
+    // compatible. El backend NO bundea coords de paradas, por eso el cliente
+    // las pasa (ya las tiene del response de /busstops).
+    const stopLat = parseFloat(req.query.stopLat);
+    const stopLng = parseFloat(req.query.stopLng);
+    const wantsTraffic = Number.isFinite(stopLat) && Number.isFinite(stopLng);
+
     try {
       const entry = await upcomingCache.dedupe(cacheKey, async () => {
         const token = await getToken();
@@ -1602,6 +1796,38 @@ exports.api = onRequest({
         if (rejected > 0) logger.info(`/upcoming/${id}: ${rejected} ETAs rechazadas`);
         return valid;
       });
+
+      // Enriquecimiento con tráfico: solo si el cliente pidió (params presentes).
+      // Cache 60s + dedupe in-flight + timeout 500ms por bus en miss. Si Google
+      // no responde, el bus queda sin `googleEtaSec` (campo opcional) y la app
+      // sigue con el ETA IMM. Próxima request hits cache.
+      if (wantsTraffic && entry?.data && Array.isArray(entry.data)) {
+        const enriched = await Promise.all(entry.data.map(async (bus) => {
+          const coords = bus?.location?.coordinates;
+          if (!Array.isArray(coords) || coords.length < 2) return bus;
+          const [busLng, busLat] = coords;
+          if (!Number.isFinite(busLat) || !Number.isFinite(busLng)) return bus;
+          const googleEtaSec = await getCachedTrafficEta(busLat, busLng, stopLat, stopLng, id);
+          return googleEtaSec != null ? { ...bus, googleEtaSec } : bus;
+        }));
+        // Recomputar ETag sobre la data enriched. Si heredáramos el ETag del
+        // entry IMM puro, clientes con cache previo recibirían 304 aunque el
+        // body real cambió (sumamos `googleEtaSec`) — bug serio. La entry
+        // enriched NO se guarda en upcomingCache (ese cache es de la IMM pura);
+        // el enriquecimiento depende de stopLat/stopLng del request.
+        const enrichedJson = JSON.stringify(enriched);
+        const enrichedEtag = '"' + crypto.createHash("md5").update(enrichedJson).digest("hex") + '"';
+        const enrichedEntry = {
+          data: enriched,
+          json: enrichedJson,
+          etag: enrichedEtag,
+          expiry: entry.expiry,
+          cachedAt: entry.cachedAt,
+          ttl: entry.ttl,
+        };
+        return sendCachedWrapped(req, res, enrichedEntry, { source: "imm+traffic" });
+      }
+
       return sendCachedWrapped(req, res, entry, { source: "imm" });
     } catch (e) {
       logger.error(`/upcoming/${id} error: ${e.message}`);
@@ -1624,14 +1850,30 @@ exports.api = onRequest({
     const now = new Date();
     const uyTime = new Date(now.toLocaleString("en-US", { timeZone: "America/Montevideo" }));
     const currentMinutes = uyTime.getHours() * 60 + uyTime.getMinutes();
+    // Día de la semana en Uruguay (0=domingo, 6=sábado)
+    const uyDow = uyTime.getDay();
+    const currentServiceKind = uyDow === 0 ? "Sun" : uyDow === 6 ? "Sat" : "WD";
 
     const result = {};
-    Object.entries(schedules).forEach(([line, times]) => {
-      // Dedupe — el GTFS del STM emite el mismo timestamp 3 veces (uno por
-      // service_id: días hábiles + sábado + domingo). El preprocesador
-      // (`process-schedules.js`) los concatena tal cual; si no dedupeamos,
-      // el cliente muestra "próximo bus: 01:04, 01:04, 01:04" en vez de
-      // 3 horarios distintos. Bug reportado 2026-05-21.
+    Object.entries(schedules).forEach(([line, raw]) => {
+      // Compat dos formatos:
+      // - v1 (viejo): raw es array de timestamps, mezcla WD/Sat/Sun. Se
+      //   dedupea por timestamp idéntico — cubre el caso patológico donde
+      //   el preprocesador concatenaba el mismo "01:04" 3 veces, pero NO
+      //   filtra el horario de fin-de-semana en día hábil (5% incorrectos).
+      // - v2 (nuevo): raw es { WD: [...], Sat: [...], Sun: [...] }. Se
+      //   sirve solo la lista del service del día actual. Resuelve el bug.
+      // El cliente nota la mejora apenas se regenera el JSON con la versión
+      // nueva de process-schedules.js — no necesita cambios.
+      let times;
+      if (Array.isArray(raw)) {
+        times = raw;
+      } else if (raw && typeof raw === "object") {
+        times = raw[currentServiceKind] || [];
+      } else {
+        return;
+      }
+
       const seen = new Set();
       const upcoming = times
         .map(t => {
@@ -1923,14 +2165,47 @@ exports.api = onRequest({
     }
   }
 
+  // ── GET /calibration/factors ── (Unif 14 / Sprint 3)
+  //
+  // Devuelve la tabla de factores de calibración multi-dim agregada por
+  // `aggregateEtaFactors` (cron cada 6h). El cliente la descarga al inicio
+  // y al despertar de background, y la aplica como multiplier al ETA
+  // fallback. Tiene cascada (exact → parent → grandpa) en el cliente.
+  //
+  // Auth NO requerida — los factores son públicos y no contienen PII.
+  // Cache-Control alto porque cambia cada 6h.
+  if (url === "/calibration/factors" && req.method === "GET") {
+    try {
+      const doc = await db.collection("system").doc("eta_calibration_factors").get();
+      if (!doc.exists) {
+        return ok(res, { buckets: {}, updatedAt: null, bucketCount: 0 }, { source: "empty" });
+      }
+      const d = doc.data() || {};
+      res.set("Cache-Control", "public, max-age=300, stale-while-revalidate=21600");
+      return ok(res, {
+        buckets: d.buckets || {},
+        updatedAt: d.updatedAt ? d.updatedAt.toDate().toISOString() : null,
+        bucketCount: d.bucketCount || 0,
+        windowDays: d.windowDays || null,
+      }, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/calibration/factors error: ${e.message}`);
+      return fail(res, "INTERNAL_ERROR");
+    }
+  }
+
   // ── POST /activity/register — push token de Live Activity ──
   // Fail-closed desde 2026-04-26: requiere idToken válido. iOS lo manda
   // siempre desde TripManager.sendPushTokenToBackend.
+  //
+  // Desde Unif 14: además del pushToken, iOS pasa el snapshot del viaje
+  // (`state` + `stopId` + `validLines` + `phase`) para que el cron pueda
+  // recomputar `nextBusEtaMin` real en background y pushear datos vivos.
   if (url === "/activity/register" && req.method === "POST") {
     if (!req.auth?.uid) {
       return fail(res, "UNAUTHORIZED", "Falta idToken");
     }
-    const { pushToken, activityId } = req.body || {};
+    const { pushToken, activityId, state, stopId, validLines, phase } = req.body || {};
     if (!pushToken) return fail(res, "INVALID_REQUEST", "Falta pushToken");
     const docId = activityId || pushToken.substring(0, 20);
     // Fire-and-forget: el consumer onAsyncWrite hace el set() async.
@@ -1939,6 +2214,10 @@ exports.api = onRequest({
       pushToken,
       activityId: activityId || "",
       ownerUid: req.auth.uid,
+      state: state || null,
+      stopId: typeof stopId === "number" ? stopId : null,
+      validLines: Array.isArray(validLines) ? validLines : [],
+      phase: typeof phase === "string" ? phase : "",
     });
     return ok(res, ack(), { source: "async" });
   }
@@ -1949,11 +2228,16 @@ exports.api = onRequest({
   // huérfanas (cliente force-quit / crashed). Sin heartbeat, después de
   // ORPHAN_THRESHOLD_MIN el cron manda push `end` en vez de `update`,
   // limpiando la LA fantasma de la lock screen del user.
+  //
+  // Desde Unif 14: el heartbeat también incluye el `state` + `stopId` +
+  // `validLines` + `phase` del viaje. Esto le permite al cron recalcular
+  // `nextBusEtaMin` real (consulta upcoming buses para `stopId`) y pushear
+  // datos vivos al widget aunque la app esté suspendida en background.
   if (url === "/activity/heartbeat" && req.method === "POST") {
     if (!req.auth?.uid) {
       return fail(res, "UNAUTHORIZED", "Falta idToken");
     }
-    const { activityId } = req.body || {};
+    const { activityId, state, stopId, validLines, phase } = req.body || {};
     if (!activityId) return fail(res, "INVALID_REQUEST", "Falta activityId");
     try {
       const ref = db.collection("live_activity_tokens").doc(activityId);
@@ -1966,9 +2250,15 @@ exports.api = onRequest({
       if (ownerUid && ownerUid !== req.auth.uid) {
         return fail(res, "FORBIDDEN", "No sos el dueño de esta actividad");
       }
-      await ref.update({
+      const update = {
         lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      };
+      if (state && typeof state === "object") update.state = state;
+      if (typeof stopId === "number") update.stopId = stopId;
+      else if (stopId === null) update.stopId = null;
+      if (Array.isArray(validLines)) update.validLines = validLines;
+      if (typeof phase === "string") update.phase = phase;
+      await ref.update(update);
       return ok(res, ack(), { source: "computed" });
     } catch (e) {
       logger.error(`/activity/heartbeat error: ${e.message}`);
@@ -2310,6 +2600,42 @@ exports.pushLiveActivityUpdates = onSchedule(
     const now = Date.now();
     const timestamp = Math.floor(now / 1000);
 
+    // Pre-pasada: agrupar activities en `waitingAtStop` por stopId para
+    // hacer UNA sola request a IMM por parada aunque haya varios viajes
+    // esperando ahí (rate-limit friendly).
+    const stopIdsToFetch = new Set();
+    for (const doc of tokens.docs) {
+      const d = doc.data();
+      if (d.phase === "waitingAtStop" && typeof d.stopId === "number" && Array.isArray(d.validLines) && d.validLines.length > 0) {
+        stopIdsToFetch.add(d.stopId);
+      }
+    }
+
+    // Fetch concurrente del feed live por cada parada involucrada. Devuelve
+    // un map { stopId → [{ line, etaMinutes, ... }] }. Si IMM falla para una
+    // parada, el map devuelve [] para esa parada — la LA cae en fallback.
+    const upcomingByStop = {};
+    if (stopIdsToFetch.size > 0) {
+      const immToken = await getToken().catch(() => null);
+      if (immToken) {
+        await Promise.all(Array.from(stopIdsToFetch).map(async (stopId) => {
+          const lines = stopLines[stopId] || [];
+          if (lines.length === 0) { upcomingByStop[stopId] = []; return; }
+          try {
+            const r = await axios.get(
+              `${BASE}/buses/busstops/${stopId}/upcomingbuses?lines=${lines.join(",")}&amountPerLine=3`,
+              { headers: { Authorization: `Bearer ${immToken}` }, timeout: 5_000 }
+            );
+            const { valid } = validateList(schemas.UpcomingBusSchema, r.data, `LA/upcoming/${stopId}`);
+            upcomingByStop[stopId] = valid;
+          } catch (e) {
+            logger.warn(`LA upcoming fetch failed for stop ${stopId}: ${e.message}`);
+            upcomingByStop[stopId] = [];
+          }
+        }));
+      }
+    }
+
     for (const doc of tokens.docs) {
       const data = doc.data();
       const { pushToken } = data;
@@ -2323,55 +2649,86 @@ exports.pushLiveActivityUpdates = onSchedule(
       const orphanByLifetime = (now - createdAt) > LA_MAX_LIFETIME_MS;
       const isOrphan = orphanByHeartbeat || orphanByLifetime;
 
-      // Payload: si es huérfana, push `end` (Apple cierra la LA en el
-      // device aunque la app esté force-killed). Si no, `update` con
-      // heartbeat mínimo para que la app la llene cuando vuelva foreground.
-      const payload = isOrphan
-        ? JSON.stringify({
-            aps: {
-              timestamp,
-              event: "end",
-              "dismissal-date": timestamp,   // dismiss inmediato
-              "content-state": {
-                stepKind: "arrived",
-                headline: "Viaje finalizado",
-                detailLine: "",
-                lineNumber: "",
-                lineColorHex: "",
-                company: "",
-                arrivalTime: "",
-                stepRemainingMin: 0,
-                stepProgress: 1,
-                currentStepIndex: 1,
-                totalSteps: 1,
-              },
+      // ── PAYLOAD BUILDER ───────────────────────────────────────────────
+      // Tres caminos:
+      // 1) Huérfana → `end`: cierra la LA en el device aunque la app esté
+      //    force-killed (Apple respeta el event=end siempre).
+      // 2) Tiene `state` guardado del iOS → repetimos el state real con
+      //    `nextBusEtaMin` recomputado desde IMM si está esperando bus.
+      //    Esta es la ruta normal post-Unif 14: el widget se actualiza
+      //    solo en background con ETAs vivos.
+      // 3) Fallback legacy: no hay state guardado (LA vieja registrada
+      //    antes de Unif 14, todavía corriendo) → mandamos placeholder
+      //    mínimo para no marcarla stale, la app la rellena al foreground.
+      let payload;
+      if (isOrphan) {
+        payload = JSON.stringify({
+          aps: {
+            timestamp,
+            event: "end",
+            "dismissal-date": timestamp,
+            "content-state": {
+              stepKind: "arrived",
+              headline: "Viaje finalizado",
+              detailLine: "",
+              lineNumber: "",
+              lineColorHex: "",
+              company: "",
+              arrivalTime: "",
+              stepRemainingMin: 0,
+              stepProgress: 1,
+              currentStepIndex: 1,
+              totalSteps: 1,
+            },
+          }
+        });
+      } else if (data.state && typeof data.state === "object") {
+        const state = { ...data.state };
+        // Si está esperando bus, recalcular ETA real desde IMM.
+        if (data.phase === "waitingAtStop" && typeof data.stopId === "number") {
+          const upcoming = upcomingByStop[data.stopId] || [];
+          const validSet = new Set((data.validLines || []).map(l => String(l).trim()).filter(Boolean));
+          if (validSet.size > 0) {
+            const candidates = upcoming.filter(u => validSet.has(String(u.line).trim()));
+            if (candidates.length > 0) {
+              const minEta = Math.min(...candidates.map(c => c.etaMinutes ?? Number.POSITIVE_INFINITY));
+              if (Number.isFinite(minEta)) state.nextBusEtaMin = Math.max(0, Math.round(minEta));
+            } else {
+              // No hay buses en vivo de las líneas válidas — limpiamos ETA
+              // en vez de mantener el viejo que ya quedó obsoleto.
+              state.nextBusEtaMin = null;
             }
-          })
-        : JSON.stringify({
-            aps: {
-              timestamp,
-              event: "update",
-              "content-state": {
-                // Minimal heartbeat — keeps the activity from going stale
-                // The app will fill real data when it comes to foreground
-                stepKind: "bus",
-                headline: "Actualizando...",
-                detailLine: "",
-                lineNumber: "",
-                lineColorHex: "",
-                company: "",
-                arrivalTime: "",
-                stepRemainingMin: 0,
-                stepProgress: 0,
-                currentStepIndex: 0,
-                totalSteps: 1,
-              },
-              "alert": {
-                title: "Vamo",
-                body: "Tu viaje se está actualizando"
-              }
-            }
-          });
+          }
+        }
+        payload = JSON.stringify({
+          aps: {
+            timestamp,
+            event: "update",
+            "content-state": state,
+          }
+        });
+      } else {
+        // Legacy fallback — sin alert para no spammear notificaciones.
+        payload = JSON.stringify({
+          aps: {
+            timestamp,
+            event: "update",
+            "content-state": {
+              stepKind: "bus",
+              headline: "Actualizando...",
+              detailLine: "",
+              lineNumber: "",
+              lineColorHex: "",
+              company: "",
+              arrivalTime: "",
+              stepRemainingMin: 0,
+              stepProgress: 0,
+              currentStepIndex: 0,
+              totalSteps: 1,
+            },
+          }
+        });
+      }
 
       try {
         const response = await axios.post(
@@ -2405,6 +2762,53 @@ exports.pushLiveActivityUpdates = onSchedule(
           logger.error(`Push failed for ${doc.id}: ${status || e.message}`);
         }
       }
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────
+// Cron: snapshot del count de buses Mvd a Firestore (cada 1 min)
+// ─────────────────────────────────────────────────────────────────
+//
+// Fuente: feed IMM directamente (NO usa busesCache porque corre en otra
+// instancia que tendría cache miss inicial siempre). Persiste en
+// `bus_count_history/{epochSec}` con `{timestamp, count}`.
+//
+// Lo consume el endpoint público `/stats/bus-count` para la gráfica en
+// chevamo.com.uy. NO bloquea polling user-facing — falla silenciosa,
+// próximo tick reintenta.
+
+exports.recordBusCount = onSchedule(
+  {
+    schedule: "every 1 minutes",
+    memory: "256MiB",
+    timeoutSeconds: 30,
+    secrets: [immClientSecret],
+    region: "southamerica-east1",
+  },
+  async () => {
+    try {
+      const token = await getToken();
+      const r = await axios.get(`${BASE}/buses`, {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 10_000,
+      });
+      const { valid } = validateList(schemas.BusSchema, r.data, "/cron:recordBusCount");
+      const count = valid.length;
+
+      const now = new Date();
+      const docId = String(Math.floor(now.getTime() / 1000));
+      await admin.firestore()
+        .collection("bus_count_history")
+        .doc(docId)
+        .set({
+          timestamp: admin.firestore.Timestamp.fromDate(now),
+          count,
+        });
+
+      logger.info(`recordBusCount: ${count} buses (${now.toISOString()})`);
+    } catch (e) {
+      logger.error(`recordBusCount error: ${e.message}`);
     }
   }
 );
@@ -2713,26 +3117,38 @@ exports.onAlertWrite = onDocumentWritten(
 const { GoogleGenAI } = require("@google/genai");
 const GEMINI_MODEL = "gemini-2.0-flash-exp";
 
-exports.adminBriefing = onRequest(
-  {
-    cors: true,
-    memory: "512MiB",
-    timeoutSeconds: 30,
-    secrets: [geminiApiKey],
-  },
-  async (req, res) => {
-    if (req.method !== "POST" && req.method !== "GET") {
-      return res.status(405).json(fail(res, "METHOD_NOT_ALLOWED"));
-    }
+/**
+ * Handler compartido del briefing — se invoca desde dos lados:
+ *  1. `exports.adminBriefing` (función standalone, URL legacy
+ *     `southamerica-east1-vamo-dbad6.cloudfunctions.net/adminBriefing`).
+ *     Se mantiene por compat hasta que el dashboard migre.
+ *  2. Path `/admin/briefing` dentro de `exports.api` → expuesto vía LB en
+ *     `api.chevamo.com.uy/admin/briefing` → cubierto por Cloud Armor.
+ *
+ * Idéntica semántica en ambos: rate limit IP → auth admin → Gemini.
+ */
+async function handleAdminBriefing(req, res) {
+  if (req.method !== "POST" && req.method !== "GET") {
+    return res.status(405).json(fail(res, "METHOD_NOT_ALLOWED"));
+  }
 
-    // Shadow auth — el Dashboard productivo aún no manda idToken. IAP en
-    // Auth fail-closed: solo emails @neodimio.com.uy verificados pueden invocar.
-    // Reemplaza el "shadow auth" anterior que loguaba pero no rechazaba —
-    // ese era launch-blocker (gasto cuota Gemini + leak de telemetría operativa).
-    const ok = await requireAdminEmail(req, res);
-    if (!ok) return; // requireAdminEmail ya escribió la respuesta 401/403
+  // Rate limit IP antes de auth — un atacante que bombardea sin token
+  // igual gasta cuota Firebase Admin (auth.verifyIdToken) y cómputo Gemini
+  // si pasa por algún caso edge. 10 req/min/IP es generoso para humanos
+  // operativos y mata scripts.
+  const clientIp = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip || "unknown";
+  if (!checkAdminRateLimit(clientIp)) {
+    return res.status(429).json({
+      ok: false,
+      error: { code: "RATE_LIMITED", message: "Demasiados intentos. Esperá un minuto." },
+    });
+  }
 
-    try {
+  // Auth fail-closed: solo emails @neodimio.com.uy verificados pueden invocar.
+  const ok = await requireAdminEmail(req, res);
+  if (!ok) return; // requireAdminEmail ya escribió la respuesta 401/403
+
+  try {
       // Recibir context del dashboard
       const context = req.method === "POST" ? req.body : {
         buses: 0,
@@ -2819,7 +3235,19 @@ Responder SOLO JSON válido.`;
         error: { code: "BRIEFING_FAILED", message: err.message },
       });
     }
-  }
+}
+
+// Función legacy (URL standalone). Se mantiene mientras el dashboard
+// productivo apunte a ella. Migrar a `api.chevamo.com.uy/admin/briefing`
+// y borrar este export en próximo sprint. Ambos comparten lógica.
+exports.adminBriefing = onRequest(
+  {
+    cors: true,
+    memory: "512MiB",
+    timeoutSeconds: 30,
+    secrets: [geminiApiKey],
+  },
+  handleAdminBriefing
 );
 
 function fallbackBriefing(ctx) {
@@ -3622,12 +4050,16 @@ exports.onAsyncWrite = onMessagePublished(
           break;
         }
         case "activity-register": {
-          const { docId, pushToken, activityId, ownerUid } = payload;
+          const { docId, pushToken, activityId, ownerUid, state, stopId, validLines, phase } = payload;
           if (!docId || !pushToken || !ownerUid) return;
           // createdAt + lastSeenAt: usados por pushLiveActivityUpdates para
           // detectar LAs huérfanas (cliente force-killed). createdAt es el
           // ancla del timeout absoluto (3h); lastSeenAt se refresca con
           // cada /activity/heartbeat del cliente vivo.
+          //
+          // state/stopId/validLines/phase: snapshot inicial del viaje. El
+          // cron los usa para pushear datos vivos (ETA recomputado) en
+          // background. Se refrescan en cada /activity/heartbeat.
           const now = admin.firestore.FieldValue.serverTimestamp();
           await db.collection("live_activity_tokens").doc(docId).set({
             pushToken,
@@ -3637,6 +4069,10 @@ exports.onAsyncWrite = onMessagePublished(
             createdAt: now,
             lastSeenAt: now,
             active: true,
+            state: state || null,
+            stopId: typeof stopId === "number" ? stopId : null,
+            validLines: Array.isArray(validLines) ? validLines : [],
+            phase: typeof phase === "string" ? phase : "",
           }, { merge: true });
           break;
         }
@@ -3762,5 +4198,164 @@ exports.nightlyGtfsBatch = onSchedule(
     }
 
     logger.info(`nightlyGtfsBatch: done — processed=${processed} skipped=${skipped} failed=${failed}`);
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────
+// Module-load: arrancar el warmer apenas la instancia `api` se inicializa.
+// Antes arrancábamos en la primera invocación del handler — eso hacía que
+// la primera request real esperara la cadena IMM cold (~2-3s) y, si el
+// cliente reintentaba, se observaba una ventana de 1-3 min de "permanente
+// error". Arrancar acá paraleliza el warm con la carga del módulo.
+//
+// Guard `FUNCTION_TARGET === 'api'`: este archivo exporta 17 funciones y
+// cada una carga el módulo en su propio container Cloud Run. Sin el guard,
+// triggers tipo `pushLiveActivityUpdates` o `nightlyGtfsBatch` también
+// arrancarían el warmer y harían requests IMM innecesarios.
+//
+// Las secrets ya están inyectadas como env vars en module-load (Firebase
+// Functions v2). Si el primer refresh falla, el setInterval reintenta.
+// ─────────────────────────────────────────────────────────────────
+if (process.env.FUNCTION_TARGET === "api") {
+  startBackgroundWarmer();
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ETA calibration aggregator (Unif 14 / Sprint 3)
+//
+// Cron que cada 6h recorre `eta_observations/{uid}/items` agregando
+// observaciones cerradas (predicted vs actual) y produce una tabla de
+// factores de corrección por bucket multi-dimensional:
+//   (line, hourBand, dayKind, rainIntensity, incidentSeverity) → factor
+//
+// El factor representa "cuánto multiplicar la ETA predicha para que
+// matchee la observada en promedio". <1 = la app predice más alto de lo
+// real; >1 = predice más bajo. Cliente lo aplica como multiplier final
+// al ETA fallback.
+//
+// Output: doc `system/eta_calibration_factors` con `{ updatedAt, buckets }`.
+// El endpoint `/calibration/factors` (dentro de `exports.api`) lo sirve.
+// ─────────────────────────────────────────────────────────────────
+
+const ETA_AGG_MIN_OBS_BUCKET = 30;       // mín obs por bucket exacto
+const ETA_AGG_MIN_OBS_PARENT = 50;       // mín obs por bucket padre (line+hour+day)
+const ETA_AGG_MIN_OBS_GRANDPA = 80;      // mín obs por bucket grandpa (line solo)
+const ETA_AGG_FACTOR_BOUNDS = [0.6, 1.5]; // mismo clamp que cliente
+const ETA_AGG_WINDOW_DAYS = 14;           // ventana de observaciones a considerar
+const ETA_AGG_MAX_OBS_PER_USER = 500;     // cap por user para no overweight
+
+/// Convierte hour del día (0-23) en hourBand del esquema cliente:
+/// 0 valle, 1 picoAM, 2 picoPM, 3 noche.
+function hourToBand(hour) {
+  if (hour >= 7 && hour <= 8) return 1;
+  if (hour >= 17 && hour <= 18) return 2;
+  if ((hour >= 22 && hour <= 23) || (hour >= 0 && hour <= 4)) return 3;
+  return 0;
+}
+
+/// Convierte dayOfWeek (1=Sun, 7=Sat conv. Calendar Apple) + isHoliday a dayKind.
+function dayKindOf(dayOfWeek, isHoliday) {
+  if (isHoliday === true) return "holiday";
+  if (dayOfWeek === 1) return "sun";
+  if (dayOfWeek === 7) return "sat";
+  return "wd";
+}
+
+function clampFactor(f) {
+  return Math.min(Math.max(f, ETA_AGG_FACTOR_BOUNDS[0]), ETA_AGG_FACTOR_BOUNDS[1]);
+}
+
+exports.aggregateEtaFactors = onSchedule(
+  { schedule: "every 6 hours", memory: "512MiB", timeoutSeconds: 540 },
+  async () => {
+    const cutoff = admin.firestore.Timestamp.fromMillis(
+      Date.now() - ETA_AGG_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    );
+
+    // Iterar users con observaciones — collectionGroup sobre subcollections.
+    const snap = await db.collectionGroup("items")
+      .where("uploadedAt", ">=", cutoff)
+      .limit(50_000)   // safety upper bound
+      .get();
+
+    if (snap.empty) {
+      logger.info("aggregateEtaFactors: no observations in window");
+      return;
+    }
+
+    // Acumular ratios por bucket en 3 niveles (exact, parent, grandpa).
+    // Mantenemos también count para deciidir si el bucket cumple el mínimo.
+    const exact = new Map();    // key → { sumRatio, count }
+    const parent = new Map();
+    const grandpa = new Map();
+
+    // Cap por user para evitar que un user power use distorsione.
+    const perUserCount = new Map();
+
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      // Path: eta_observations/{uid}/items/{obsId}
+      const uid = doc.ref.parent.parent?.id || "anon";
+      const used = perUserCount.get(uid) || 0;
+      if (used >= ETA_AGG_MAX_OBS_PER_USER) continue;
+
+      const predicted = Number(d.predictedSec);
+      const actual = Number(d.actualSec);
+      if (!Number.isFinite(predicted) || !Number.isFinite(actual)) continue;
+      if (actual < 60 || actual > 1800 || predicted < 60 || predicted > 1800) continue;
+      const ratio = predicted / actual;
+      if (ratio < 0.2 || ratio > 5) continue;
+
+      const line = (d.line || "").trim();
+      if (!line) continue;
+      const hour = Number(d.hourBand);
+      const band = Number.isFinite(hour) ? hourToBand(hour) : 0;
+      const dow = Number(d.dayOfWeek) || 0;
+      const dayKind = dayKindOf(dow, d.isHoliday);
+      const rain = d.rainIntensity || (d.isRaining ? "light" : "none");
+      const severity = (d.incidentSeverity || "none").toLowerCase();
+
+      const exactKey = `${line}|${band}|${dayKind}|${rain}|${severity}`;
+      const parentKey = `${line}|${band}|${dayKind}|none|none`;
+      const grandpaKey = `${line}|-1|any|none|none`;
+
+      const add = (map, key) => {
+        const cur = map.get(key) || { sumRatio: 0, count: 0 };
+        cur.sumRatio += ratio;
+        cur.count += 1;
+        map.set(key, cur);
+      };
+      add(exact, exactKey);
+      add(parent, parentKey);
+      add(grandpa, grandpaKey);
+      perUserCount.set(uid, used + 1);
+    }
+
+    // Construir factors output. Combinamos los 3 niveles en un único map —
+    // las keys son disjoint por construcción (parent tiene "none|none" en
+    // rain+severity, grandpa tiene "-1|any|..."), así que no colisionan.
+    const factors = {};
+    for (const [key, v] of exact) {
+      if (v.count < ETA_AGG_MIN_OBS_BUCKET) continue;
+      factors[key] = clampFactor(v.count / v.sumRatio); // = avg(actual/pred) = 1/avg(ratio)
+    }
+    for (const [key, v] of parent) {
+      if (v.count < ETA_AGG_MIN_OBS_PARENT) continue;
+      factors[key] = clampFactor(v.count / v.sumRatio);
+    }
+    for (const [key, v] of grandpa) {
+      if (v.count < ETA_AGG_MIN_OBS_GRANDPA) continue;
+      factors[key] = clampFactor(v.count / v.sumRatio);
+    }
+
+    await db.collection("system").doc("eta_calibration_factors").set({
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      windowDays: ETA_AGG_WINDOW_DAYS,
+      observationsConsidered: snap.size,
+      users: perUserCount.size,
+      bucketCount: Object.keys(factors).length,
+      buckets: factors,
+    });
+    logger.info(`aggregateEtaFactors: ${Object.keys(factors).length} buckets desde ${snap.size} obs / ${perUserCount.size} users`);
   }
 );
