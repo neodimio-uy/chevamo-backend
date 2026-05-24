@@ -31,6 +31,9 @@
 const ctx = require("./eta-context");
 const stabilizer = require("./eta-stabilizer");
 const calibrator = require("./eta-calibrator-lookup");
+const positionFuser = require("./position-fuser");
+const sourceConfidence = require("./source-confidence");
+const clusterer = require("./community-clusterer");
 
 /** Cota inferior absoluta del etaFinal — buses dentro del minuto siguiente
  *  igual se reportan como "1 min" (Math.max(1, …) en el stabilizer). */
@@ -117,14 +120,79 @@ function computeConfidence({ bus, etaSource, trafficApplied, calibSource }) {
 }
 
 /**
+ * Busca un cluster comunitario que matchee con este bus IMM. Devuelve
+ * `{ cluster, fused }` cuando hay match + fusion exitosa, sino null.
+ *
+ * **No recalcula el ETA**. Mirror del comportamiento de iOS en
+ * `officialWithConfirmations` (FallbackETACalculator.swift:271-287): cuando
+ * hay match, se respeta el `etaRaw` IMM y solo se enriquece con
+ * `communityConfirmations`. La posición fusionada va al mapa, no al ETA.
+ */
+function matchCluster({ bus, clustersByLine, immAgeSec, now }) {
+  if (!clustersByLine || typeof clustersByLine.get !== "function") return null;
+  const line = (bus.line || "").trim();
+  if (!line) return null;
+  const candidates = clustersByLine.get(line);
+  if (!candidates || candidates.length === 0) return null;
+
+  const coords = bus?.location?.coordinates;
+  if (!Array.isArray(coords) || coords.length < 2) return null;
+  const [busLng, busLat] = coords;
+  if (!Number.isFinite(busLat) || !Number.isFinite(busLng)) return null;
+
+  for (const c of candidates) {
+    const rep = c.representative;
+    if (!rep) continue;
+    // Match estricto por linea + lineVariantId + radio CommunityMatchConfig
+    if (!positionFuser.sameVehicle({
+      immLine: line,
+      immVariantId: bus.lineVariantId,
+      immCoord: { lat: busLat, lng: busLng },
+      clusterLine: rep.line,
+      clusterVariantId: rep.lineVariantId,
+      clusterCoord: { lat: rep.lat, lng: rep.lng },
+    })) continue;
+
+    const comAge = clusterer.ageSeconds(rep.updatedAt, now.getTime());
+    const immConf = sourceConfidence.forIMM({
+      ageSeconds: immAgeSec,
+      isZombie: false,
+      speedKmh: typeof bus.speed === "number" ? bus.speed * 3.6 : null,
+    });
+    const comConf = sourceConfidence.forCommunity({
+      ageSeconds: comAge,
+      reporterCount: c.reporterCount,
+      speedKmh: typeof rep.speed === "number" ? rep.speed * 3.6 : null,
+    });
+    const fused = positionFuser.fuse({
+      immCoord: { lat: busLat, lng: busLng },
+      immAge: immAgeSec,
+      immConfidence: immConf,
+      comCoord: { lat: rep.lat, lng: rep.lng },
+      comAge,
+      comConfidence: comConf,
+    });
+    return { cluster: c, fused, immConf, comConf, comAge };
+  }
+  return null;
+}
+
+/**
  * Fusiona un único bus. Async porque consulta calibrator lookup
  * (con cache). Devuelve el bus + campos nuevos.
  *
  * Si `compareMode` es true, agrega `_etaTelemetry` con el breakdown del
- * cálculo. Útil para `?compare=1` y BigQuery logging. NO se envía al
- * cliente en modo normal.
+ * cálculo. Útil para `?compare=1` y BigQuery logging.
+ *
+ * **Sprint 0+1**: Si `clustersByLine` viene poblado y hay cluster matching,
+ * se enriquece el bus con:
+ *   - `communityConfirmations`: cluster.reporterCount
+ *   - `etaSource`: "imm+community" (o "imm+google+community" si traffic aplicó)
+ *   - Si la fusion fue exitosa, `location.coordinates` se mueve a la
+ *     posición fusionada (mejor render en mapa). El ETA NO se recalcula —
+ *     se respeta el ETA IMM como hace iOS en officialWithConfirmations.
  */
-async function fuseBus({ bus, stopId, now, admin, compareMode = false }) {
+async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersByLine, immAgeSec = 30 }) {
   const { baseEtaSec, source: baseSource } = pickBase(bus);
 
   if (baseEtaSec == null) {
@@ -138,6 +206,11 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false }) {
       }),
     };
   }
+
+  // Match comunidad (no toca baseEtaSec, solo enriquece)
+  const communityMatch = baseSource === "imm"
+    ? matchCluster({ bus, clustersByLine, immAgeSec, now })
+    : null;
 
   // Multipliers contextuales
   const hourMul = ctx.hourMultiplier(now);
@@ -170,21 +243,49 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false }) {
   const stabKey = `${stopId}:${busId}`;
   const etaFinalMin = stabilizer.stabilize({ key: stabKey, etaFinalSec, now });
 
-  // Etiqueta de fuente final. Si traffic se aplicó, lo señalamos.
+  // Etiqueta de fuente final. Si traffic se aplicó, lo señalamos. Si hay
+  // match comunidad, sumamos el sufijo "+community".
   let etaSource = baseSource;
   if (trafficApplied) etaSource = `${baseSource}+google-traffic`;
+  if (communityMatch) etaSource = `${etaSource}+community`;
 
-  // Confidence
-  const etaConfidence = computeConfidence({ bus, etaSource: baseSource, trafficApplied, calibSource });
+  // Confidence (incluye boost por comunidad cuando hay match)
+  let etaConfidence = computeConfidence({ bus, etaSource: baseSource, trafficApplied, calibSource });
+  if (communityMatch) {
+    // +0.1 por reporters extras pero cap a 1.0 (mismo patrón que iOS).
+    const reporterBonus = Math.min(0.15, communityMatch.cluster.reporterCount * 0.05);
+    etaConfidence = Math.min(1.0, Number((etaConfidence + reporterBonus).toFixed(3)));
+  }
+
+  // Si la fusion comunidad movió la posición, actualizamos location.coordinates
+  // para que el marker en el mapa se vea en el lugar correcto. NO tocamos
+  // ETA — eso queda como vino de IMM (mismo comportamiento iOS).
+  let locationOverride = null;
+  if (communityMatch?.fused?.coordinate) {
+    const { lat, lng } = communityMatch.fused.coordinate;
+    locationOverride = {
+      ...bus.location,
+      coordinates: [lng, lat],
+    };
+  }
 
   const result = {
     ...bus,
+    ...(locationOverride && { location: locationOverride }),
     // Devolvemos segundos: el cliente convierte a minutos si necesita
     // (consistente con `etaRaw` y `googleEtaSec`). El stabilizer ya redondeó
     // a minutos enteros, por eso multiplicamos × 60 antes de exponer.
     etaFinalSec: etaFinalMin * 60,
     etaSource,
     etaConfidence,
+    // Sprint 0+1: enriquecimiento comunidad (mirror de iOS).
+    ...(communityMatch && {
+      communityConfirmations: communityMatch.cluster.reporterCount,
+      // Id del cluster matched — útil para el handler (skip al construir
+      // buses puros) y para el cliente (correlación con listener Firestore
+      // local). Es el id del doc representative del cluster.
+      communityClusterId: communityMatch.cluster.representative?.id || null,
+    }),
   };
 
   if (compareMode) {
@@ -201,6 +302,16 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false }) {
       bucket,
       preStabilizeSec: Math.round(etaFinalSec),
       stabilizedMinutes: etaFinalMin,
+      community: communityMatch ? {
+        matched: true,
+        reporterCount: communityMatch.cluster.reporterCount,
+        immConf: Number(communityMatch.immConf.toFixed(3)),
+        comConf: Number(communityMatch.comConf.toFixed(3)),
+        comAgeSec: Math.round(communityMatch.comAge),
+        weightIMM: communityMatch.fused ? Number(communityMatch.fused.weightIMM.toFixed(3)) : null,
+        weightCommunity: communityMatch.fused ? Number(communityMatch.fused.weightCommunity.toFixed(3)) : null,
+        fusedCoord: communityMatch.fused?.coordinate || null,
+      } : { matched: false },
     };
   }
 
@@ -211,14 +322,161 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false }) {
  * Fusiona un array de UpcomingBus. Orquesta el async lookup del calibrator
  * (cacheado, así que típicamente sin IO real) y delega cada bus a `fuseBus`.
  */
-async function fuseBuses({ buses, stopId, now = new Date(), admin, compareMode = false }) {
+async function fuseBuses({
+  buses,
+  stopId,
+  now = new Date(),
+  admin,
+  compareMode = false,
+  clustersByLine,
+  immAgeSec = 30,
+}) {
   if (!Array.isArray(buses) || buses.length === 0) return [];
   // Pre-cargar buckets de calibration (single IO + cache TTL 5min).
   await calibrator.factor({
     bucket: { line: "_warm_", hourBand: 0, dayKind: "wd" },
     admin,
   });
-  return Promise.all(buses.map((bus) => fuseBus({ bus, stopId, now, admin, compareMode })));
+  return Promise.all(
+    buses.map((bus) => fuseBus({ bus, stopId, now, admin, compareMode, clustersByLine, immAgeSec })),
+  );
+}
+
+/**
+ * Construye buses comunitarios PUROS — clusters que NO matchearon ningún
+ * bus IMM, para líneas que paran en `stopLines`. Cada uno se modela como
+ * `UpcomingBus` con `etaFinalSec` calculado desde haversine × 1.4 ÷ speed.
+ *
+ * Port del bucle iOS `FallbackETACalculator.swift:289-349`.
+ *
+ * Filtros (mirror iOS):
+ *   - Cluster no stale (age < 90s — ya lo garantiza community-cache, pero
+ *     re-chequeamos por defensa)
+ *   - Línea pertenece al `stopLines` de la parada actual
+ *   - Cluster no fue matched a un bus IMM (`matchedClusterIds`)
+ *   - Distancia haversine ≥ 100m y < 3000m
+ *   - ETA computado < 1800s (30 min) — sino descarta
+ *
+ * @param {object} opts
+ *   - clustersByLine: Map<line, Cluster[]> de community-cache
+ *   - stopLines: Array<string> líneas que paran en esta parada
+ *   - stopCoord: { lat, lng }
+ *   - matchedClusterIds: Set<string> ya consumidos por fuseBus
+ *   - now: Date
+ *   - admin: para calibrator lookup
+ *   - compareMode: bool
+ * @returns {Promise<UpcomingBus[]>}
+ */
+async function buildPureCommunityBuses({
+  clustersByLine,
+  stopLines = [],
+  stopCoord,
+  matchedClusterIds = new Set(),
+  now = new Date(),
+  admin,
+  compareMode = false,
+}) {
+  if (!clustersByLine || !stopCoord) return [];
+  if (!stopLines || stopLines.length === 0) return [];
+  const stopLinesSet = new Set(stopLines.map((l) => String(l).trim()));
+
+  const results = [];
+  for (const [line, clusters] of clustersByLine) {
+    if (!stopLinesSet.has(line)) continue;
+    for (const cluster of clusters) {
+      const rep = cluster.representative;
+      if (!rep) continue;
+      if (matchedClusterIds.has(rep.id)) continue;
+      const comAge = clusterer.ageSeconds(rep.updatedAt, now.getTime());
+      if (comAge > 90) continue;
+
+      const straightDist = positionFuser.haversineMeters(
+        { lat: rep.lat, lng: rep.lng },
+        stopCoord,
+      );
+      const distMeters = straightDist * 1.4;
+      if (distMeters < 100 || distMeters >= 3000) continue;
+
+      // Velocidad efectiva (iOS pattern): bajo 5 m/s usar promedio con 4.2,
+      // sino max(speed, 3).
+      const speedMs = typeof rep.speed === "number" ? rep.speed : 0;
+      const effectiveMs = speedMs < 5 ? (speedMs + 4.2) / 2 : Math.max(speedMs, 3);
+      const baseEta = distMeters / effectiveMs;
+
+      // Calibration bucket cascada (mismo bucket que fuseBus)
+      const bucket = {
+        line,
+        hourBand: ctx.hourToBand(ctx.uyHour(now)),
+        dayKind: ctx.dayKind(now),
+        rainIntensity: "none",
+        incidentSeverity: "none",
+      };
+      const { factor: calibFactor, source: calibSource } = await calibrator.factor({ bucket, admin });
+
+      const etaSec = ctx.apply({
+        baseEtaSec: baseEta,
+        intermediateStops: 0,
+        date: now,
+        rainIntensity: "none",
+        calibrationFactor: calibFactor,
+      });
+      const cappedEtaSec = Math.max(etaSec, 60);
+      if (cappedEtaSec >= 1800) continue;
+
+      // Stabilizer (clave única por cluster id + parada)
+      const stabKey = `${stopCoord.lat.toFixed(4)},${stopCoord.lng.toFixed(4)}:cluster:${rep.id}`;
+      const etaFinalMin = stabilizer.stabilize({ key: stabKey, etaFinalSec: cappedEtaSec, now });
+
+      const bus = {
+        // Schema compatible con UpcomingBus iOS — campos requeridos solo
+        // los que iOS lee. `eta: 0` indica "sin ETA IMM oficial" — la app
+        // hoy chequea `position < 0` o `position === 0` para identificar
+        // buses no-IMM. Acá `position: -1` ⇒ "comunidad pura" (DataOrigin.community).
+        busId: `community:${rep.id}`,
+        line,
+        companyName: rep.company || "",
+        origin: rep.origin || null,
+        destination: rep.destination || null,
+        subline: null,
+        special: false,
+        eta: 0,
+        distance: Math.round(distMeters),
+        position: -1, // negative = community
+        access: null,
+        thermalConfort: null,
+        emissions: null,
+        location: {
+          type: "Point",
+          coordinates: [rep.lng, rep.lat],
+        },
+        lineVariantId: rep.lineVariantId,
+        // Sprint 0+1 campos nuevos
+        etaFinalSec: etaFinalMin * 60,
+        etaSource: "community",
+        etaConfidence: Math.min(0.9, 0.4 + cluster.reporterCount * 0.1),
+        communityConfirmations: cluster.reporterCount,
+        communityClusterId: rep.id,
+      };
+      if (compareMode) {
+        bus._etaTelemetry = {
+          baseSource: "community",
+          straightDistM: Math.round(straightDist),
+          distMetersAdjusted: Math.round(distMeters),
+          speedMs: Number(speedMs.toFixed(2)),
+          effectiveMs: Number(effectiveMs.toFixed(2)),
+          baseEtaSec: Math.round(baseEta),
+          calibFactor,
+          calibSource,
+          cappedEtaSec: Math.round(cappedEtaSec),
+          stabilizedMinutes: etaFinalMin,
+          reporterCount: cluster.reporterCount,
+          comAgeSec: Math.round(comAge),
+        };
+      }
+      results.push(bus);
+    }
+  }
+  return results;
 }
 
 module.exports = {
@@ -228,6 +486,8 @@ module.exports = {
   pickBase,
   computeTrafficFactor,
   computeConfidence,
+  matchCluster,
   fuseBus,
   fuseBuses,
+  buildPureCommunityBuses,
 };

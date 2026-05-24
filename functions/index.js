@@ -63,6 +63,7 @@ const { extractMvdNeighborhood, normalizeLineKey } = require("./lib/stats-aggreg
 const etaFusion = require("./lib/eta-fusion");
 const etaContext = require("./lib/eta-context");
 const etaTelemetry = require("./lib/eta-telemetry");
+const communityCache = require("./lib/community-cache");
 const { ack } = require("./lib/schemas/ack");
 const {
   adaptCurrent: adaptWeatherCurrent,
@@ -1980,6 +1981,26 @@ exports.api = onRequest({
       }
 
       const compareMode = req.query.compare === "1";
+
+      // Sprint 0+1: pre-cargar clusters comunitarios por línea para las
+      // líneas que paran en esta parada. Lazy fetch con cache TTL 30s.
+      // Si la lectura falla, `clustersByLine` queda como Map vacío y la
+      // fusion procede sin enriquecimiento comunidad (degradación graceful).
+      let clustersByLine = new Map();
+      try {
+        for (const line of lines) {
+          const lineKey = String(line).trim();
+          if (!lineKey) continue;
+          const clusters = await communityCache.getActiveClustersByLine(lineKey, admin);
+          if (clusters && clusters.length > 0) {
+            clustersByLine.set(lineKey, clusters);
+          }
+        }
+      } catch (commErr) {
+        logger.warn(`/upcoming/${id} community pre-fetch failed: ${commErr.message}`);
+        clustersByLine = new Map();
+      }
+
       if (processed.length > 0) {
         try {
           processed = await etaFusion.fuseBuses({
@@ -1988,10 +2009,39 @@ exports.api = onRequest({
             now: new Date(),
             admin,
             compareMode,
+            clustersByLine,
           });
           pipelineSource += "+fusion";
         } catch (fusionErr) {
           logger.warn(`/upcoming/${id} fusion failed: ${fusionErr.message}`);
+        }
+      }
+
+      // Sprint 0+1: inyectar buses puros comunitarios (clusters que NO
+      // matchearon ningún bus IMM) para las líneas de esta parada. Solo si
+      // tenemos las coords de la parada (sino no podemos calcular distancia).
+      if (wantsTraffic && clustersByLine.size > 0) {
+        const matchedClusterIds = new Set(
+          processed
+            .map((b) => b.communityClusterId)
+            .filter(Boolean)
+        );
+        try {
+          const pureBuses = await etaFusion.buildPureCommunityBuses({
+            clustersByLine,
+            stopLines: lines,
+            stopCoord: { lat: stopLat, lng: stopLng },
+            matchedClusterIds,
+            now: new Date(),
+            admin,
+            compareMode,
+          });
+          if (pureBuses.length > 0) {
+            processed = processed.concat(pureBuses);
+            pipelineSource += `+community(${pureBuses.length})`;
+          }
+        } catch (pureErr) {
+          logger.warn(`/upcoming/${id} pure-community failed: ${pureErr.message}`);
         }
       }
 
