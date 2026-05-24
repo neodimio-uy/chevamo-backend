@@ -1,0 +1,254 @@
+swagger: "2.0"
+info:
+  title: CheVamo API v1
+  description: >
+    API pública de CheVamo para consumir datos del transporte público
+    (Mvd + otras ciudades futuras). Requiere API key per-consumer.
+    Las keys tienen restricciones de uso (HTTP referrer / app ID) y
+    cuotas independientes.
+  version: 1.0.0
+host: chevamo-api-gateway-PLACEHOLDER.gateway.dev
+schemes:
+  - https
+produces:
+  - application/json
+
+# ─── Backend (Cloud Run) ─────────────────────────────────────────────
+# Todas las paths se forwardean al mismo Cloud Run que hoy sirve
+# api.chevamo.com.uy. El gateway agrega la capa de api_key + cuotas +
+# analytics sin tocar el backend.
+x-google-backend:
+  address: https://api-uz7smrj4ua-rj.a.run.app
+  path_translation: APPEND_PATH_TO_ADDRESS
+  deadline: 30.0
+
+# ─── Security ────────────────────────────────────────────────────────
+# `api_key`: query string `?key=` o header `x-api-key`. Las 5 keys
+# (ios/android/3 webs) se crean en GCP Console > API Keys con sus
+# restrictions independientes (HTTP referrer / iOS bundle id / Android
+# package name + SHA-1).
+securityDefinitions:
+  api_key:
+    type: apiKey
+    name: key
+    in: query
+
+security:
+  - api_key: []
+
+# ─── Paths públicos del API ──────────────────────────────────────────
+paths:
+  /buses:
+    get:
+      summary: Buses live (Mvd)
+      operationId: getBuses
+      responses:
+        "200":
+          description: OK
+
+  /buses/bylines:
+    get:
+      summary: Buses live filtrados por líneas
+      operationId: getBusesByLines
+      parameters:
+        - name: lines
+          in: query
+          required: true
+          type: string
+      responses:
+        "200":
+          description: OK
+
+  /buses/linevariants:
+    get:
+      summary: Variantes de líneas (catalog)
+      operationId: getLineVariants
+      responses:
+        "200":
+          description: OK
+
+  /busstops:
+    get:
+      summary: Catálogo de paradas (Mvd)
+      operationId: getBusStops
+      responses:
+        "200":
+          description: OK
+
+  /busstops/{id}/upcoming:
+    get:
+      summary: Próximos arribos en una parada
+      operationId: getUpcomingForStop
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: string
+        - name: stopLat
+          in: query
+          required: false
+          type: number
+        - name: stopLng
+          in: query
+          required: false
+          type: number
+        - name: amount
+          in: query
+          required: false
+          type: integer
+        - name: compare
+          in: query
+          required: false
+          type: string
+      responses:
+        "200":
+          description: OK
+
+  /busstops/{id}/lines:
+    get:
+      summary: Líneas que pasan por una parada
+      operationId: getLinesForStop
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: string
+      responses:
+        "200":
+          description: OK
+
+  /busstops/{id}/schedules:
+    get:
+      summary: Horarios programados de una parada
+      operationId: getSchedulesForStop
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: string
+      responses:
+        "200":
+          description: OK
+
+  /shapes/{shapeId}:
+    get:
+      summary: Geometría del recorrido de una variante
+      operationId: getShape
+      parameters:
+        - name: shapeId
+          in: path
+          required: true
+          type: string
+      responses:
+        "200":
+          description: OK
+
+  /variants/{shapeId}/stops:
+    get:
+      summary: Paradas en orden del recorrido de una variante
+      operationId: getVariantStops
+      parameters:
+        - name: shapeId
+          in: path
+          required: true
+          type: string
+      responses:
+        "200":
+          description: OK
+
+  /places/autocomplete:
+    get:
+      summary: Autocomplete de lugares (proxy Places API New)
+      operationId: placesAutocomplete
+      parameters:
+        - name: q
+          in: query
+          required: true
+          type: string
+        - name: lat
+          in: query
+          required: false
+          type: number
+        - name: lng
+          in: query
+          required: false
+          type: number
+      responses:
+        "200":
+          description: OK
+
+  /places/details:
+    get:
+      summary: Detalle de un lugar (proxy Places API New)
+      operationId: placesDetails
+      parameters:
+        - name: placeId
+          in: query
+          required: true
+          type: string
+      responses:
+        "200":
+          description: OK
+
+  /directions:
+    post:
+      summary: Routing transit (proxy Google Directions + IMM)
+      operationId: directions
+      consumes:
+        - application/json
+      responses:
+        "200":
+          description: OK
+
+  /jurisdictions:
+    get:
+      summary: Jurisdictions catalog
+      operationId: getJurisdictions
+      responses:
+        "200":
+          description: OK
+
+  /metro-areas:
+    get:
+      summary: Metro areas catalog
+      operationId: getMetroAreas
+      responses:
+        "200":
+          description: OK
+
+  /national-networks:
+    get:
+      summary: National networks catalog
+      operationId: getNationalNetworks
+      responses:
+        "200":
+          description: OK
+
+  /operators:
+    get:
+      summary: Operators catalog
+      operationId: getOperators
+      responses:
+        "200":
+          description: OK
+
+  /stats/summary:
+    get:
+      summary: Resumen agregado para data.chevamo.com.uy
+      operationId: statsSummary
+      responses:
+        "200":
+          description: OK
+
+  /stats/bus-count:
+    get:
+      summary: Histórico de count buses live (gráfica)
+      operationId: statsBusCount
+      parameters:
+        - name: hours
+          in: query
+          required: false
+          type: integer
+      responses:
+        "200":
+          description: OK

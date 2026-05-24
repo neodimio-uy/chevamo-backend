@@ -65,7 +65,10 @@ const etaContext = require("./lib/eta-context");
 const etaTelemetry = require("./lib/eta-telemetry");
 const telemetry = require("./lib/telemetry");
 const stopsCatalog = require("./lib/stops-catalog");
+const shapesCatalog = require("./lib/shapes-catalog");
+const variantsCatalog = require("./lib/variants-catalog");
 const arrivalsDetector = require("./lib/arrivals-detector");
+const apiKeys = require("./lib/api-keys");
 const immStmAdapter = require("./lib/adapters/imm-stm");
 const communityCache = require("./lib/community-cache");
 const { ack } = require("./lib/schemas/ack");
@@ -802,6 +805,7 @@ exports.api = onRequest({
   secrets: [
     googleMapsKey, immClientSecret, geminiApiKey,
     mpAccessTokenUY, mpAccessTokenAR, mpAccessTokenBR, mpWebhookSecret,
+    apiKeys.chevamoApiKeysSecret,
   ],
 }, async (req, res) => {
   // Arrancar warmer en la primera invocación de esta instancia
@@ -825,6 +829,15 @@ exports.api = onRequest({
   // ── Shadow auth: pobla req.auth y req.appCheck si vienen tokens válidos.
   // No rechaza requests sin tokens — los endpoints sensibles validan abajo.
   await extractAuth(req);
+
+  // ── API keys per-consumer ──
+  // Reemplazo de Cloud API Gateway (que agregaba +200-500ms cross-region).
+  // Modo monitor por default; cuando todos los clients (iOS+Android+3 webs)
+  // hayan adoptado el header `X-API-Key`, switchear a enforce con env
+  // `API_KEYS_ENFORCE=true`. Endpoints con Firebase Auth propia (/me,
+  // /community, /admin, /activity) están exentos. Si valid, `req.consumer`
+  // queda seteado para downstream telemetry/rate-limit per-consumer.
+  if (!apiKeys.requireApiKey(req, res, url)) return;
 
   // ── /admin/briefing — expuesto via api.chevamo.com.uy para que pase por
   // el LB + Cloud Armor (rate limit /admin/* dedicado). Comparte lógica con
@@ -2172,6 +2185,54 @@ exports.api = onRequest({
     } catch (e) {
       logger.error(`/linevariants error: ${e.message}`);
       return fail(res, "IMM_UNAVAILABLE");
+    }
+  }
+
+  // ── GET /variants/:shapeId/stops ─────────────────────────────────
+  // Devuelve las paradas (ordenadas por stop_sequence) que toca el
+  // recorrido de una variante. shape_id == lineVariantId del feed IMM.
+  //
+  // Caso de uso: al click en un bus en el mapa, mostrar las paradas
+  // específicas de SU variante (no todas las de la línea, que mezclan
+  // múltiples variantes ida/vuelta/express).
+  //
+  // Response: { shape_id, stops: ["stopId", ...] }. El cliente hace
+  // join con su catalog de stops para obtener coords + nombres.
+  // Cache HTTP 24h (cambia con pipeline GTFS mensual).
+  const variantStopsMatch = url.match(/^\/variants\/([\w-]+)\/stops$/);
+  if (variantStopsMatch && req.method === "GET") {
+    const shapeId = variantStopsMatch[1];
+    try {
+      const stops = variantsCatalog.getStopsForShape(shapeId);
+      if (!stops) return fail(res, "NOT_FOUND", `variant ${shapeId} no existe`);
+      res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
+      return ok(res, { shape_id: shapeId, stops }, { source: "gtfs-static" });
+    } catch (e) {
+      logger.error(`/variants/${shapeId}/stops error: ${e.message}`);
+      return fail(res, "INTERNAL_ERROR");
+    }
+  }
+
+  // ── GET /shapes/:shapeId ─────────────────────────────────────────
+  // Devuelve los puntos del recorrido (shape GTFS) de una variante.
+  // shape_id mapea 1:1 a lineVariantId del feed IMM, así que el cliente
+  // puede ir directo desde un bus a su recorrido completo:
+  //   bus.lineVariantId → GET /shapes/:lineVariantId
+  // Response: { shape_id, points: [[lat, lng], ...] }.
+  // Cache HTTP largo (24h) — los shapes solo cambian con el pipeline GTFS.
+  const shapeMatch = url.match(/^\/shapes\/([\w-]+)$/);
+  if (shapeMatch && req.method === "GET") {
+    const shapeId = shapeMatch[1];
+    try {
+      const points = await shapesCatalog.getShape(shapeId);
+      if (!points) {
+        return fail(res, "NOT_FOUND", `shape ${shapeId} no existe`);
+      }
+      res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
+      return ok(res, { shape_id: shapeId, points }, { source: "gtfs-static" });
+    } catch (e) {
+      logger.error(`/shapes/${shapeId} error: ${e.message}`);
+      return fail(res, "INTERNAL_ERROR");
     }
   }
 
