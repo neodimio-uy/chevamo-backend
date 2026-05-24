@@ -56,10 +56,13 @@ function publishAsyncWrite(kind, payload) {
 const { ok, fail } = require("./lib/response");
 const schemas = require("./lib/schemas");
 const { validateList, validateObject } = require("./lib/validate");
-const { extractAuth, requireAdminEmail } = require("./lib/auth");
+const { extractAuth, requireAdminEmail, requireAppCheck, getAppCheckStats } = require("./lib/auth");
 const staticFeeds = require("./lib/static-feeds");
 const staticGtfsPipeline = require("./lib/pipelines/static-gtfs");
 const { extractMvdNeighborhood, normalizeLineKey } = require("./lib/stats-aggregations");
+const etaFusion = require("./lib/eta-fusion");
+const etaContext = require("./lib/eta-context");
+const etaTelemetry = require("./lib/eta-telemetry");
 const { ack } = require("./lib/schemas/ack");
 const {
   adaptCurrent: adaptWeatherCurrent,
@@ -1909,6 +1912,7 @@ exports.api = onRequest({
   // ── GET /busstops/:id/upcoming ── (migrado)
   const upcomingMatch = url.match(/^\/busstops\/(\d+)\/upcoming$/);
   if (upcomingMatch && req.method === "GET") {
+    if (!requireAppCheck(req, res, "/busstops/:id/upcoming")) return;
     const id = upcomingMatch[1];
     const lines = stopLines[id] || [];
     if (lines.length === 0) return ok(res, [], { source: "gtfs" });
@@ -1946,12 +1950,25 @@ exports.api = onRequest({
         return valid;
       });
 
-      // Enriquecimiento con tráfico: solo si el cliente pidió (params presentes).
-      // Cache 60s + dedupe in-flight + timeout 500ms por bus en miss. Si Google
-      // no responde, el bus queda sin `googleEtaSec` (campo opcional) y la app
-      // sigue con el ETA IMM. Próxima request hits cache.
-      if (wantsTraffic && entry?.data && Array.isArray(entry.data)) {
-        const enriched = await Promise.all(entry.data.map(async (bus) => {
+      // Pipeline post-cache IMM:
+      //   1) entry.data = IMM raw (cacheado por upcomingCache.dedupe)
+      //   2) Si vienen stopLat/stopLng: enriquecer con Google Distance Matrix
+      //   3) Fusion server-side: aplica multipliers contextuales + calibración
+      //      bucket cascada + stabilizer. Agrega etaFinal/etaSource/etaConfidence
+      //      por bus. SI FALLA, devolvemos IMM/Google crudos — el cliente cae a
+      //      su cálculo local. La fusion no puede romper el endpoint.
+      //
+      // Modo ?compare=1 agrega `_etaTelemetry` por bus con el breakdown del
+      // cálculo (A/B observability sin tocar clientes). El modo normal no
+      // incluye telemetry. Cliente iOS pre-Sprint 0 sigue leyendo `etaRaw`
+      // (intacto, backwards-compat); cliente con Remote Config flag lee
+      // `etaFinal` y deshabilita su pipeline local.
+
+      let processed = (entry?.data && Array.isArray(entry.data)) ? entry.data : [];
+      let pipelineSource = "imm";
+
+      if (wantsTraffic && processed.length > 0) {
+        processed = await Promise.all(processed.map(async (bus) => {
           const coords = bus?.location?.coordinates;
           if (!Array.isArray(coords) || coords.length < 2) return bus;
           const [busLng, busLat] = coords;
@@ -1959,25 +1976,58 @@ exports.api = onRequest({
           const googleEtaSec = await getCachedTrafficEta(busLat, busLng, stopLat, stopLng, id);
           return googleEtaSec != null ? { ...bus, googleEtaSec } : bus;
         }));
-        // Recomputar ETag sobre la data enriched. Si heredáramos el ETag del
-        // entry IMM puro, clientes con cache previo recibirían 304 aunque el
-        // body real cambió (sumamos `googleEtaSec`) — bug serio. La entry
-        // enriched NO se guarda en upcomingCache (ese cache es de la IMM pura);
-        // el enriquecimiento depende de stopLat/stopLng del request.
-        const enrichedJson = JSON.stringify(enriched);
-        const enrichedEtag = '"' + crypto.createHash("md5").update(enrichedJson).digest("hex") + '"';
-        const enrichedEntry = {
-          data: enriched,
-          json: enrichedJson,
-          etag: enrichedEtag,
-          expiry: entry.expiry,
-          cachedAt: entry.cachedAt,
-          ttl: entry.ttl,
-        };
-        return sendCachedWrapped(req, res, enrichedEntry, { source: "imm+traffic" });
+        pipelineSource = "imm+traffic";
       }
 
-      return sendCachedWrapped(req, res, entry, { source: "imm" });
+      const compareMode = req.query.compare === "1";
+      if (processed.length > 0) {
+        try {
+          processed = await etaFusion.fuseBuses({
+            buses: processed,
+            stopId: id,
+            now: new Date(),
+            admin,
+            compareMode,
+          });
+          pipelineSource += "+fusion";
+        } catch (fusionErr) {
+          logger.warn(`/upcoming/${id} fusion failed: ${fusionErr.message}`);
+        }
+      }
+
+      // Telemetry fire-and-forget para BigQuery (vía Pub/Sub sink). No
+      // bloquea el response. Si `ETA_TELEMETRY_TOPIC` no está seteado en
+      // el env, es no-op silencioso. Ver `lib/eta-telemetry.js` para el
+      // setup GCP del topic + BQ sink.
+      etaTelemetry.publish(
+        etaTelemetry.buildRequestEvent({
+          stopId: id,
+          path: "/busstops/:id/upcoming",
+          wantsTraffic,
+          compareMode,
+          req,
+          processed,
+          pipelineSource,
+          ctx: etaContext,
+        })
+      );
+
+      // Recomputar ETag sobre la data procesada. Si heredáramos el ETag del
+      // entry IMM puro, clientes con cache previo recibirían 304 aunque el
+      // body real cambió (sumamos `etaFinal`, `googleEtaSec`, etc.) — bug
+      // serio. El processedEntry NO se guarda en upcomingCache; ese cache
+      // sigue siendo de IMM pura.
+      const processedJson = JSON.stringify(processed);
+      const processedEtag = '"' + crypto.createHash("md5").update(processedJson).digest("hex") + '"';
+      const processedEntry = {
+        data: processed,
+        json: processedJson,
+        etag: processedEtag,
+        expiry: entry?.expiry,
+        cachedAt: entry?.cachedAt,
+        ttl: entry?.ttl,
+      };
+      return sendCachedWrapped(req, res, processedEntry, { source: pipelineSource });
     } catch (e) {
       logger.error(`/upcoming/${id} error: ${e.message}`);
       const stale = upcomingCache.getStale(cacheKey);
@@ -2173,6 +2223,7 @@ exports.api = onRequest({
 
   // ── POST /directions ── (migrado)
   if (url === "/directions" && req.method === "POST") {
+    if (!requireAppCheck(req, res, "/directions")) return;
     // Zod: tipos numéricos enforced + bounds amplios lat/lng antes del
     // chequeo geo `inBoundsUY` más estricto. Sin esto, parseFloat("xyz")
     // pasaba `NaN` que el chequeo `!fromLat` (falsy en 0) no detectaba.
