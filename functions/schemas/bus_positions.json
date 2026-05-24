@@ -1,0 +1,20 @@
+[
+  { "name": "ts", "type": "TIMESTAMP", "mode": "REQUIRED", "description": "Timestamp del snapshot (server time)." },
+  { "name": "busId", "type": "STRING", "mode": "REQUIRED", "description": "ID interno del bus (formato 'imm-stm:NNNN' o solo NNNN)." },
+  { "name": "line", "type": "STRING", "mode": "REQUIRED", "description": "Identificador de línea (ej '144', 'D1', 'CA1')." },
+  { "name": "lineVariantId", "type": "STRING", "mode": "NULLABLE", "description": "ID de variante/ramal cuando IMM lo provee." },
+  { "name": "destination", "type": "STRING", "mode": "NULLABLE", "description": "Headsign del trip ('CENTRO', 'CERRO', etc)." },
+  { "name": "origin", "type": "STRING", "mode": "NULLABLE", "description": "Origen del trip si IMM lo provee." },
+  { "name": "company", "type": "STRING", "mode": "NULLABLE", "description": "Empresa operadora (CUTCSA, COETC, COMESA, UCOT, etc)." },
+  { "name": "lat", "type": "FLOAT64", "mode": "REQUIRED", "description": "Latitud GPS." },
+  { "name": "lng", "type": "FLOAT64", "mode": "REQUIRED", "description": "Longitud GPS." },
+  { "name": "speedKmh", "type": "FLOAT64", "mode": "NULLABLE", "description": "Velocidad reportada por el feed (0-150)." },
+  { "name": "feedTs", "type": "TIMESTAMP", "mode": "NULLABLE", "description": "Timestamp del feed original IMM (puede ser distinto al server ts)." },
+  { "name": "stalenessSec", "type": "INT64", "mode": "NULLABLE", "description": "Segundos entre feedTs y ts (latencia feed→server)." },
+  { "name": "distFromPrevM", "type": "FLOAT64", "mode": "NULLABLE", "description": "Distancia haversine desde la observación previa del mismo bus, en metros. NULL si es la primera obs en el ciclo warm." },
+  { "name": "secsSincePrev", "type": "INT64", "mode": "NULLABLE", "description": "Segundos desde la observación previa del mismo bus." },
+  { "name": "uyHour", "type": "INT64", "mode": "NULLABLE", "description": "Hora local UY (0-23)." },
+  { "name": "uyHourBand", "type": "INT64", "mode": "NULLABLE", "description": "Banda horaria 0-3." },
+  { "name": "uyDayKind", "type": "STRING", "mode": "NULLABLE", "description": "weekday | saturday | sunday | holiday." },
+  { "name": "source", "type": "STRING", "mode": "NULLABLE", "description": "Origen del dato: 'imm' (futuro: 'community')." }
+]

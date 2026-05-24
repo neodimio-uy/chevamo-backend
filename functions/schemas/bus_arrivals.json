@@ -1,0 +1,21 @@
+[
+  { "name": "ts", "type": "TIMESTAMP", "mode": "REQUIRED", "description": "Timestamp del evento detectado (server time)." },
+  { "name": "busId", "type": "STRING", "mode": "REQUIRED", "description": "ID interno del bus." },
+  { "name": "line", "type": "STRING", "mode": "REQUIRED", "description": "Línea del bus." },
+  { "name": "lineVariantId", "type": "STRING", "mode": "NULLABLE", "description": "Variante/ramal si está disponible." },
+  { "name": "destination", "type": "STRING", "mode": "NULLABLE", "description": "Headsign al momento del evento." },
+  { "name": "company", "type": "STRING", "mode": "NULLABLE", "description": "Empresa." },
+  { "name": "stopId", "type": "STRING", "mode": "REQUIRED", "description": "ID de la parada (busstopId IMM)." },
+  { "name": "stopName", "type": "STRING", "mode": "NULLABLE", "description": "Nombre de la parada (cross-streets) si está en el catalog." },
+  { "name": "eventType", "type": "STRING", "mode": "REQUIRED", "description": "'arrived' (bus entró al radio) | 'departed' (bus salió del radio)." },
+  { "name": "distM", "type": "FLOAT64", "mode": "NULLABLE", "description": "Distancia bus-parada al momento del evento, en metros." },
+  { "name": "minDistInWindowM", "type": "FLOAT64", "mode": "NULLABLE", "description": "Distancia mínima alcanzada durante la ventana de proximidad (solo para 'departed')." },
+  { "name": "speedKmh", "type": "FLOAT64", "mode": "NULLABLE", "description": "Velocidad bus al momento del evento." },
+  { "name": "dwellSec", "type": "INT64", "mode": "NULLABLE", "description": "Segundos que el bus permaneció en el radio (solo para 'departed')." },
+  { "name": "lat", "type": "FLOAT64", "mode": "NULLABLE", "description": "Latitud bus al momento del evento." },
+  { "name": "lng", "type": "FLOAT64", "mode": "NULLABLE", "description": "Longitud bus al momento del evento." },
+  { "name": "uyHour", "type": "INT64", "mode": "NULLABLE" },
+  { "name": "uyHourBand", "type": "INT64", "mode": "NULLABLE" },
+  { "name": "uyDayKind", "type": "STRING", "mode": "NULLABLE" },
+  { "name": "source", "type": "STRING", "mode": "NULLABLE", "description": "'imm-proximity' (futuro: 'community-report' | 'imm-event')." }
+]

@@ -63,6 +63,10 @@ const { extractMvdNeighborhood, normalizeLineKey } = require("./lib/stats-aggreg
 const etaFusion = require("./lib/eta-fusion");
 const etaContext = require("./lib/eta-context");
 const etaTelemetry = require("./lib/eta-telemetry");
+const telemetry = require("./lib/telemetry");
+const stopsCatalog = require("./lib/stops-catalog");
+const arrivalsDetector = require("./lib/arrivals-detector");
+const immStmAdapter = require("./lib/adapters/imm-stm");
 const communityCache = require("./lib/community-cache");
 const { ack } = require("./lib/schemas/ack");
 const {
@@ -3107,6 +3111,148 @@ exports.recordBusCount = onSchedule(
       logger.info(`recordBusCount: ${count} live buses (${ghosts} ghosts filtered) at ${now.toISOString()}`);
     } catch (e) {
       logger.error(`recordBusCount error: ${e.message}`);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────
+// Cron: snapshots GPS de buses Mvd → BigQuery via Pub/Sub
+// ─────────────────────────────────────────────────────────────────
+//
+// Telemetry hub Fase A (transport-side). Emite a 2 topics:
+//   POSITIONS_TELEMETRY_TOPIC → bus_positions  (1 row por bus por tick)
+//   ARRIVALS_TELEMETRY_TOPIC  → bus_arrivals   (eventos arrived/departed)
+//
+// Schedule: cada 1 min (Cloud Scheduler min 60s). En horas pico UY
+// (7-9am y 17-19hs), la function hace 2 ticks separados por sleep(30s)
+// dentro de la misma invocación → resolución efectiva 30s en pico.
+// Vale el costo extra (~$6/mes) porque buses se mueven rápido entre
+// paradas en pico y a 60s perderíamos ~25% de eventos arrived/departed.
+//
+// Sin env vars seteados, la función sigue corriendo pero los publishes
+// son no-op (permite deployar sin activar el sink). Fail silenciosamente
+// si IMM falla; próximo tick reintenta.
+//
+// VPC connector REQUERIDO: el detector arrivals usa Redis L2 para
+// persistir state entre ticks. Sin VPC, Redis falla silencioso y CADA
+// tick re-detecta arrived sin departed (state vacío).
+
+const POSITIONS_PREV_TTL_MS = 5 * 60 * 1000;
+const positionsPrevByBus = new Map(); // L1 in-memory por instancia warm
+
+function isPeakHourUY(date) {
+  const h = etaContext.uyHour(date);
+  return h === 7 || h === 8 || h === 17 || h === 18;
+}
+
+async function runRecordBusPositionsTick(label) {
+  const t0 = Date.now();
+  const token = await getToken();
+  const r = await axios.get(`${BASE}/buses`, {
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 10_000,
+  });
+  const { valid: rawValid } = validateList(
+    schemas.BusSchema,
+    r.data,
+    "/cron:recordBusPositions"
+  );
+
+  const { vehicles } = immStmAdapter.mapFeedToVehicles(rawValid, {
+    cityId: "uy.mvd-area-metro",
+    mode: "bus",
+    feedSource: "imm-stm",
+  });
+
+  const now = new Date();
+  const nowMs = now.getTime();
+
+  // Filtro fantasma 90s (idéntico a recordBusCount + iOS Bus.isStaleGhost)
+  const live = vehicles.filter((v) => {
+    if (typeof v.timestamp !== "number") return false;
+    return (nowMs - v.timestamp * 1000) / 1000 <= 90;
+  });
+
+  // Publish positions con dedupe por movimiento <5m
+  let positionsPublished = 0;
+  let positionsSkippedNoMove = 0;
+  for (const bus of live) {
+    const busId = String(bus.id || "");
+    if (!busId) continue;
+    const coords = bus.position;
+    if (!coords) continue;
+    const prev = positionsPrevByBus.get(busId);
+    if (prev) {
+      const distFromPrev = telemetry.haversineMeters(
+        coords.lat, coords.lng, prev.lat, prev.lng
+      );
+      if (distFromPrev < 5) {
+        positionsSkippedNoMove++;
+        // No publicamos position, pero el detector arrivals igual procesa
+        // el bus (puede estar dwelling en una parada y queremos emit departed).
+        continue;
+      }
+    }
+    telemetry.publishBusPosition(bus, {
+      now,
+      etaCtx: etaContext,
+      prevObs: prev ? { ts: prev.ts, lat: prev.lat, lng: prev.lng } : null,
+    });
+    positionsPublished++;
+    positionsPrevByBus.set(busId, { ts: nowMs, lat: coords.lat, lng: coords.lng });
+  }
+
+  // GC prev cache: limpiar entries >5min sin update
+  for (const [busId, entry] of positionsPrevByBus.entries()) {
+    if (nowMs - entry.ts > POSITIONS_PREV_TTL_MS) {
+      positionsPrevByBus.delete(busId);
+    }
+  }
+
+  // Arrivals detector — requiere catalog stops cargado + Redis L2 conectado
+  let arrivalsStats = { arrivedCount: 0, departedCount: 0, processedBuses: 0, skippedNoLine: 0 };
+  try {
+    await stopsCatalog.ensureLoaded(getToken);
+    arrivalsStats = await arrivalsDetector.processSnapshot({
+      buses: live,
+      now,
+      etaCtx: etaContext,
+    });
+  } catch (e) {
+    logger.warn(`recordBusPositions[${label}]: arrivals detector skipped: ${e.message}`);
+  }
+
+  const ms = Date.now() - t0;
+  logger.info(
+    `recordBusPositions[${label}]: ${positionsPublished}/${live.length} pos (skip_no_move=${positionsSkippedNoMove}, ghosts=${vehicles.length - live.length}) ` +
+    `| arrivals: ${arrivalsStats.arrivedCount} arr / ${arrivalsStats.departedCount} dep ` +
+    `(proc=${arrivalsStats.processedBuses}, no_line=${arrivalsStats.skippedNoLine}) | ${ms}ms`
+  );
+  return arrivalsStats;
+}
+
+exports.recordBusPositions = onSchedule(
+  {
+    schedule: "every 1 minutes",
+    memory: "512MiB",
+    timeoutSeconds: 90, // peak: ~5s + 30s sleep + ~5s = ~40s margen amplio
+    secrets: [immClientSecret],
+    region: "southamerica-east1",
+    vpcConnector: "vamo-connector-saeast",
+    vpcConnectorEgressSettings: "PRIVATE_RANGES_ONLY",
+  },
+  async () => {
+    const tickAt = new Date();
+    try {
+      if (isPeakHourUY(tickAt)) {
+        await runRecordBusPositionsTick("peak-A");
+        await new Promise((r) => setTimeout(r, 30_000));
+        await runRecordBusPositionsTick("peak-B");
+      } else {
+        await runRecordBusPositionsTick("std");
+      }
+    } catch (e) {
+      logger.error(`recordBusPositions error: ${e.message}`);
     }
   }
 );
