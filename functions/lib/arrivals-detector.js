@@ -99,6 +99,11 @@ async function processSnapshot({ buses, now, etaCtx }) {
       skippedNoLine++;
       continue;
     }
+    // Composite key porque el feed IMM tiene `busId` numérico no único
+    // entre líneas (2 buses físicos pueden compartir el mismo busId).
+    // Sin esto, el state del Redis pisa entre buses de distintas líneas.
+    const variantId = bus.trip?.tripId || "";
+    const stateKey = `${busId}|${line}|${variantId}`;
 
     const candidates = getStopsForLine(line);
     if (candidates.length === 0) {
@@ -111,7 +116,7 @@ async function processSnapshot({ buses, now, etaCtx }) {
 
     processedBuses++;
 
-    const prevForBus = prevBuses[busId] || {};
+    const prevForBus = prevBuses[stateKey] || {};
     const nowForBus = {};
 
     for (const stop of candidates) {
@@ -165,7 +170,7 @@ async function processSnapshot({ buses, now, etaCtx }) {
     }
 
     if (Object.keys(nowForBus).length > 0) {
-      nextBuses[busId] = nowForBus;
+      nextBuses[stateKey] = nowForBus;
     }
   }
 

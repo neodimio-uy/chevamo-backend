@@ -112,7 +112,10 @@ exports.deleteMyAccount = onCall(
       ),
       safeQueryDelete(
         "shared_trips",
-        db.collection("shared_trips").where("ownerUid", "==", uid),
+        // Field es `ownerId` (mismo nombre que rules + index.js:4056).
+        // Estaba `ownerUid` mismatch — cleanup no borraba nada al
+        // eliminar cuenta. Fix A1.5 Bloque A.
+        db.collection("shared_trips").where("ownerId", "==", uid),
         errors
       ),
       safeQueryDelete(

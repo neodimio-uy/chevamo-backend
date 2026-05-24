@@ -567,13 +567,19 @@ function haversineMeters(a, b) {
   return 2 * R * Math.asin(Math.sqrt(x));
 }
 
-function checkRateLimit(ip) {
+/**
+ * Rate limit por clave. Si se pasa el uid (request autenticada), usamos
+ * eso — más justo que IP cuando muchos users comparten NAT/CGNAT móvil.
+ * Si no hay uid, caemos a IP (default). Cloud Armor priority 1000 hace
+ * cap global IP previo a este, así que este es el límite per-actor.
+ */
+function checkRateLimit(key) {
   const now = Date.now();
-  let entry = rateLimitMap.get(ip);
+  let entry = rateLimitMap.get(key);
 
   if (!entry || now >= entry.resetAt) {
     entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW };
-    rateLimitMap.set(ip, entry);
+    rateLimitMap.set(key, entry);
   }
 
   entry.count++;
@@ -795,7 +801,19 @@ function startBackgroundWarmer() {
 }
 
 exports.api = onRequest({
-  cors: true,
+  // CORS whitelist explícita (no `*`). Cubre todas las webs del grupo +
+  // localhost dev. iOS/Android nativos no usan CORS (no browser preflight),
+  // siguen funcionando sin Origin header.
+  cors: [
+    "https://chevamo.com.uy",
+    "https://dashboard.chevamo.com.uy",
+    "https://data.chevamo.com.uy",
+    "https://admin.chevamo.com.uy",
+    "https://status.chevamo.com.uy",
+    "https://vamo-dbad6.web.app",
+    /^http:\/\/localhost(:\d+)?$/,
+    /^http:\/\/127\.0\.0\.1(:\d+)?$/,
+  ],
   memory: "2GiB",
   timeoutSeconds: 60,
   minInstances: 1,               // mantener instancia warm 24/7 para el warmer
@@ -814,21 +832,39 @@ exports.api = onRequest({
   const url = req.path;
   const clientIp = req.headers["x-forwarded-for"] || req.ip || "unknown";
 
-  // ── Rate limit ──
-  if (!checkRateLimit(clientIp)) {
-    logger.warn(`Rate limited: ${clientIp}`);
-    return fail(res, "RATE_LIMITED");
-  }
-
-  // ── Body size limit (P1 audit) ──
+  // ── Body size limit (P1 audit) — antes que cualquier work ──
   const contentLength = parseInt(req.headers["content-length"] || "0", 10);
   if (contentLength > MAX_BODY_BYTES) {
     return fail(res, "INVALID_REQUEST", "Body excede tamaño máximo");
   }
 
+  // ── OWASP security headers (Helmet equivalente) ──
+  // Aplicar a TODAS las respuestas para defensa en profundidad.
+  // CSP en `default-src 'none'` es seguro para API JSON-only (no
+  // servimos HTML). Si en el futuro un endpoint devuelve HTML/SVG,
+  // override per-route.
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("X-Frame-Options", "DENY");
+  res.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+  res.set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  res.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+
   // ── Shadow auth: pobla req.auth y req.appCheck si vienen tokens válidos.
   // No rechaza requests sin tokens — los endpoints sensibles validan abajo.
   await extractAuth(req);
+
+  // ── Rate limit por uid (preferido) o IP (fallback) ──
+  // Cuando hay user autenticado, limitamos por uid — más justo que IP
+  // (NAT/CGNAT móvil hace que varios users compartan IP). Sin uid
+  // (request anónima), seguimos por IP. Cloud Armor priority 1000 ya
+  // tiene cap global IP previo a este, así que actúa como segundo
+  // anillo per-actor.
+  const rateLimitKey = req.auth?.uid || `ip:${clientIp}`;
+  if (!checkRateLimit(rateLimitKey)) {
+    logger.warn(`Rate limited: ${rateLimitKey}`);
+    return fail(res, "RATE_LIMITED");
+  }
 
   // ── API keys per-consumer ──
   // Reemplazo de Cloud API Gateway (que agregaba +200-500ms cross-region).
@@ -3234,15 +3270,22 @@ async function runRecordBusPositionsTick(label) {
     return (nowMs - v.timestamp * 1000) / 1000 <= 90;
   });
 
-  // Publish positions con dedupe por movimiento <5m
+  // Publish positions con dedupe por movimiento <5m.
+  // El feed IMM tiene `busId` numérico que NO es único globalmente —
+  // 2 buses físicos de líneas distintas pueden compartir el mismo
+  // busId (ej "imm-stm:105" puede ser bus de línea 169 + bus de
+  // línea 300). Para que el dedupe no los pise entre sí, la clave
+  // del Map combina busId + lineVariantId.
   let positionsPublished = 0;
   let positionsSkippedNoMove = 0;
   for (const bus of live) {
     const busId = String(bus.id || "");
     if (!busId) continue;
+    const variantId = bus.trip?.tripId || bus.trip?.routeShortName || "";
+    const prevKey = `${busId}|${variantId}`;
     const coords = bus.position;
     if (!coords) continue;
-    const prev = positionsPrevByBus.get(busId);
+    const prev = positionsPrevByBus.get(prevKey);
     if (prev) {
       const distFromPrev = telemetry.haversineMeters(
         coords.lat, coords.lng, prev.lat, prev.lng
@@ -3260,13 +3303,13 @@ async function runRecordBusPositionsTick(label) {
       prevObs: prev ? { ts: prev.ts, lat: prev.lat, lng: prev.lng } : null,
     });
     positionsPublished++;
-    positionsPrevByBus.set(busId, { ts: nowMs, lat: coords.lat, lng: coords.lng });
+    positionsPrevByBus.set(prevKey, { ts: nowMs, lat: coords.lat, lng: coords.lng });
   }
 
   // GC prev cache: limpiar entries >5min sin update
-  for (const [busId, entry] of positionsPrevByBus.entries()) {
+  for (const [key, entry] of positionsPrevByBus.entries()) {
     if (nowMs - entry.ts > POSITIONS_PREV_TTL_MS) {
-      positionsPrevByBus.delete(busId);
+      positionsPrevByBus.delete(key);
     }
   }
 
@@ -3747,7 +3790,14 @@ Responder SOLO JSON válido.`;
 // y borrar este export en próximo sprint. Ambos comparten lógica.
 exports.adminBriefing = onRequest(
   {
-    cors: true,
+    // CORS whitelist explícita (no `*`). Solo dominios admin del grupo.
+    // Si se agrega otro panel admin, sumar acá.
+    cors: [
+      "https://vamo-dbad6.web.app",       // admin.chevamo legacy hosting
+      "https://admin.chevamo.com.uy",     // admin futuro custom domain
+      "https://dashboard.chevamo.com.uy", // portal user-facing (no usa briefing pero por si)
+      /^http:\/\/localhost(:\d+)?$/,      // dev local
+    ],
     memory: "512MiB",
     timeoutSeconds: 30,
     secrets: [geminiApiKey],
