@@ -59,6 +59,7 @@ const { validateList, validateObject } = require("./lib/validate");
 const { extractAuth, requireAdminEmail } = require("./lib/auth");
 const staticFeeds = require("./lib/static-feeds");
 const staticGtfsPipeline = require("./lib/pipelines/static-gtfs");
+const { extractMvdNeighborhood, normalizeLineKey } = require("./lib/stats-aggregations");
 const { ack } = require("./lib/schemas/ack");
 const {
   adaptCurrent: adaptWeatherCurrent,
@@ -334,6 +335,15 @@ const trafficEtaCache = new RequestCache(60_000, "traffic-eta");
 // en chevamo.com.uy) sin servir data muy obsoleta. Key incluye `hours`
 // porque el downsampling depende de la ventana solicitada.
 const statsBusCountCache = new RequestCache(30_000, "stats-bus-count");
+// Caches del portal público `data.chevamo.com.uy`. TTL ajustados a la cadencia
+// real de los crons que escriben en Firestore (no tiene sentido cachear más
+// fresco que la fuente):
+//   - top-reported-lines: cron 15 min → cache 60 s (refresh rápido entre crons)
+//   - top-destinations:   cron 30 min → cache 60 s
+//   - summary:            no tiene cron, on-demand counts → cache 30 s
+const statsTopLinesCache       = new RequestCache(60_000, "stats-top-lines");
+const statsTopDestinationsCache = new RequestCache(60_000, "stats-top-destinations");
+const statsSummaryCache        = new RequestCache(30_000, "stats-summary");
 
 // ─────────────────────────────────────────────────────────────────
 // Google Distance Matrix con tráfico (enriquecimiento del ETA)
@@ -1757,6 +1767,145 @@ exports.api = onRequest({
     }
   }
 
+  // ── GET /stats/top-reported-lines ── (público, sin auth)
+  //
+  // Top N líneas con más reportes comunitarios activos en las últimas N
+  // horas. Lo escribe el cron `aggregateCommunityReports` cada 15 min en
+  // `top_reported_lines_cache/snapshot`. Si la doc no existe (cron no corrió
+  // o data limpiada), devuelve array vacío con HTTP 200 — el cliente debe
+  // renderear "Sin datos por ahora".
+  //
+  // Query params:
+  //   - limit (default 10, max 50)
+  //
+  // Devuelve: { hours, generatedAt, lines: [{line, count}] }
+  if (url.startsWith("/stats/top-reported-lines") && req.method === "GET") {
+    const limitRaw = parseInt(req.query.limit, 10);
+    const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 10, 1), 50);
+    try {
+      const entry = await statsTopLinesCache.dedupe(`limit:${limit}`, async () => {
+        const doc = await admin.firestore()
+          .collection("top_reported_lines_cache")
+          .doc("snapshot")
+          .get();
+        if (!doc.exists) {
+          return { hours: 24, generatedAt: null, lines: [] };
+        }
+        const data = doc.data() || {};
+        const all = Array.isArray(data.lines) ? data.lines : [];
+        return {
+          hours: data.hours || 24,
+          generatedAt: data.generatedAt ? data.generatedAt.toMillis() : null,
+          lines: all.slice(0, limit),
+        };
+      });
+      return sendCachedWrapped(req, res, entry, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/stats/top-reported-lines error: ${e.message}`);
+      return fail(res, "STATS_UNAVAILABLE", "No se pudo leer el ranking de líneas reportadas");
+    }
+  }
+
+  // ── GET /stats/top-destinations ── (público, sin auth)
+  //
+  // Top N destinos (barrios Mvd) más buscados en `Che, ¿a dónde vamos?` en
+  // los últimos 7 días. Filtro de privacidad: solo aparecen barrios con N≥50
+  // hits/semana, aplicado por el cron antes de escribir el cache.
+  //
+  // Query params:
+  //   - limit (default 10, max 50)
+  //
+  // Devuelve: { hours, threshold, generatedAt, destinations: [{neighborhood, count}] }
+  if (url.startsWith("/stats/top-destinations") && req.method === "GET") {
+    const limitRaw = parseInt(req.query.limit, 10);
+    const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 10, 1), 50);
+    try {
+      const entry = await statsTopDestinationsCache.dedupe(`limit:${limit}`, async () => {
+        const doc = await admin.firestore()
+          .collection("top_destinations_cache")
+          .doc("snapshot")
+          .get();
+        if (!doc.exists) {
+          return { hours: 168, threshold: 50, generatedAt: null, destinations: [] };
+        }
+        const data = doc.data() || {};
+        const all = Array.isArray(data.destinations) ? data.destinations : [];
+        return {
+          hours: data.hours || 168,
+          threshold: data.threshold || 50,
+          generatedAt: data.generatedAt ? data.generatedAt.toMillis() : null,
+          destinations: all.slice(0, limit),
+        };
+      });
+      return sendCachedWrapped(req, res, entry, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/stats/top-destinations error: ${e.message}`);
+      return fail(res, "STATS_UNAVAILABLE", "No se pudo leer el ranking de destinos");
+    }
+  }
+
+  // ── GET /stats/summary ── (público, sin auth)
+  //
+  // Snapshot de los contadores principales del sistema en este momento.
+  // Pensado para el "KPI strip" de `data.chevamo.com.uy`. Lee del cache
+  // `bus_count_history` (último doc) + `stop_lines.json` (paradas) + lista
+  // estática de empresas Mvd + count de community_buses activos ahora.
+  //
+  // Devuelve: { busesNow, stops, lines, companies, communityReportsNow, generatedAt }
+  if (url === "/stats/summary" && req.method === "GET") {
+    try {
+      const entry = await statsSummaryCache.dedupe("summary", async () => {
+        const db = admin.firestore();
+        // Buses ahora: último doc de bus_count_history (escrito cada 1 min
+        // por `recordBusCount` con filtro ghost 90s aplicado).
+        const lastCountSnap = await db
+          .collection("bus_count_history")
+          .orderBy("timestamp", "desc")
+          .limit(1)
+          .get();
+        const busesNow = lastCountSnap.empty
+          ? 0
+          : (lastCountSnap.docs[0].data().count || 0);
+        // Community reports activos ahora: filtramos por updatedAt en últimos
+        // 3 min (mismo cutoff que cleanupStaleCommunityBuses).
+        const cutoff = admin.firestore.Timestamp.fromDate(
+          new Date(Date.now() - 3 * 60 * 1000)
+        );
+        const reportsSnap = await db
+          .collection("community_buses")
+          .where("updatedAt", ">=", cutoff)
+          .get();
+        const communityReportsNow = reportsSnap.size;
+        // Paradas: count del bundled stop_lines.json (ya cargado en memoria).
+        const stops = Object.keys(stopLines).length;
+        // Líneas únicas: derivar de stop_lines (cada parada tiene array de líneas).
+        const lineSet = new Set();
+        for (const arr of Object.values(stopLines)) {
+          if (Array.isArray(arr)) {
+            for (const l of arr) lineSet.add(String(l).trim());
+          }
+        }
+        const lines = lineSet.size;
+        // Empresas Mvd urbanas conocidas (whitelist del cliente — alineado
+        // con CompanyColors.swift). Si en el futuro hay un registry server-side
+        // unificado, leer de ahí.
+        const companies = 4; // CUTCSA, COETC, COMESA, UCOT
+        return {
+          busesNow,
+          stops,
+          lines,
+          companies,
+          communityReportsNow,
+          generatedAt: Date.now(),
+        };
+      });
+      return sendCachedWrapped(req, res, entry, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/stats/summary error: ${e.message}`);
+      return fail(res, "STATS_UNAVAILABLE", "No se pudo computar el resumen");
+    }
+  }
+
   // ── GET /busstops/:id/upcoming ── (migrado)
   const upcomingMatch = url.match(/^\/busstops\/(\d+)\/upcoming$/);
   if (upcomingMatch && req.method === "GET") {
@@ -2068,6 +2217,35 @@ exports.api = onRequest({
         }
         return parsed.data;
       });
+      // Logging async para `/stats/top-destinations` del portal público.
+      // Privacy-first: solo guardamos el barrio del destino (si caemos en
+      // alguno de los 62 barrios Mvd reconocidos). Si el address no matchea
+      // ningún barrio, descartamos el evento — preferimos perder un punto a
+      // guardar una dirección exacta. NO se persiste origen, NO coordenadas
+      // del destino, NO userId. TTL Firestore 30 días (policy externa).
+      //
+      // No bloquea la response: fire-and-forget. Si Firestore está caído, el
+      // user no se entera. El cron de agregación re-corre cada 30 min.
+      try {
+        const firstRoute = Array.isArray(entry?.routes) ? entry.routes[0] : null;
+        const candidate =
+          firstRoute?.endAddress ||
+          firstRoute?.summary ||
+          "";
+        const neighborhood = extractMvdNeighborhood(candidate);
+        if (neighborhood) {
+          admin.firestore()
+            .collection("directions_log")
+            .add({
+              ts: admin.firestore.FieldValue.serverTimestamp(),
+              destNeighborhood: neighborhood,
+            })
+            .catch((err) => logger.warn(`directions_log write failed: ${err.message}`));
+        }
+      } catch (e) {
+        // Logging es estrictamente opcional, nunca debe romper la response.
+        logger.warn(`directions_log derivation error: ${e.message}`);
+      }
       return sendCachedWrapped(req, res, entry, { source: "google" });
     } catch (e) {
       logger.error(`/directions error: ${e.message}`);
@@ -4376,5 +4554,125 @@ exports.aggregateEtaFactors = onSchedule(
       buckets: factors,
     });
     logger.info(`aggregateEtaFactors: ${Object.keys(factors).length} buckets desde ${snap.size} obs / ${perUserCount.size} users`);
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────
+// Crons: agregaciones del portal `data.chevamo.com.uy`
+// ─────────────────────────────────────────────────────────────────
+//
+// Dos crons separados porque las fuentes y cadencias son distintas:
+//   - `aggregateCommunityReports` cada 15 min — lee `community_buses` y
+//     escribe top líneas de últimas 24h en `top_reported_lines_cache/snapshot`
+//   - `aggregateDirectionsLog` cada 30 min — lee `directions_log` y
+//     escribe top destinos de últimos 7 días en `top_destinations_cache/snapshot`
+//     aplicando filtro de privacidad N≥50 (no exponemos barrios poco buscados)
+//
+// Ambos cron sobrescriben un único doc `snapshot` (no historia) — los endpoints
+// públicos sirven la última versión. Si se quiere historia, agregar segundo
+// doc con epochSec como id (mismo patrón que `bus_count_history`).
+
+exports.aggregateCommunityReports = onSchedule(
+  {
+    schedule: "every 15 minutes",
+    memory: "256MiB",
+    timeoutSeconds: 60,
+    region: "southamerica-east1",
+  },
+  async () => {
+    try {
+      const db = admin.firestore();
+      const hours = 24;
+      const cutoff = admin.firestore.Timestamp.fromDate(
+        new Date(Date.now() - hours * 3600 * 1000)
+      );
+      // Leemos por startedAt (cuándo arrancó el reporte) en vez de updatedAt
+      // (cuándo fue el último heartbeat). Así no sub-contamos viajes cortos
+      // que terminaron hace horas pero fueron en la ventana.
+      const snap = await db
+        .collection("community_buses")
+        .where("startedAt", ">=", cutoff)
+        .get();
+
+      // Agregar por línea normalizada. Cada doc = un viaje reportado.
+      const counts = new Map();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        const lineKey = normalizeLineKey(data.line);
+        if (!lineKey) continue;
+        counts.set(lineKey, (counts.get(lineKey) || 0) + 1);
+      }
+      const lines = Array.from(counts.entries())
+        .map(([line, count]) => ({ line, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 50); // hard cap 50 — el endpoint sirve hasta `limit=50`
+
+      await db
+        .collection("top_reported_lines_cache")
+        .doc("snapshot")
+        .set({
+          hours,
+          generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          totalReports: snap.size,
+          lines,
+        });
+
+      logger.info(`aggregateCommunityReports: ${lines.length} líneas, ${snap.size} reportes en ${hours}h`);
+    } catch (e) {
+      logger.error(`aggregateCommunityReports error: ${e.message}`);
+    }
+  }
+);
+
+exports.aggregateDirectionsLog = onSchedule(
+  {
+    schedule: "every 30 minutes",
+    memory: "256MiB",
+    timeoutSeconds: 120,
+    region: "southamerica-east1",
+  },
+  async () => {
+    try {
+      const db = admin.firestore();
+      const hours = 168; // 7 días
+      const threshold = 50; // mínimo hits/semana para aparecer en el ranking público
+      const cutoff = admin.firestore.Timestamp.fromDate(
+        new Date(Date.now() - hours * 3600 * 1000)
+      );
+      const snap = await db
+        .collection("directions_log")
+        .where("ts", ">=", cutoff)
+        .get();
+
+      const counts = new Map();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        const n = data.destNeighborhood;
+        if (!n) continue;
+        counts.set(n, (counts.get(n) || 0) + 1);
+      }
+      // Aplicar threshold de privacidad ANTES del slice — barrios con menos
+      // de N hits no aparecen NUNCA en la lista pública, ni siquiera al final.
+      const destinations = Array.from(counts.entries())
+        .filter(([, count]) => count >= threshold)
+        .map(([neighborhood, count]) => ({ neighborhood, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 50);
+
+      await db
+        .collection("top_destinations_cache")
+        .doc("snapshot")
+        .set({
+          hours,
+          threshold,
+          generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          totalHits: snap.size,
+          destinations,
+        });
+
+      logger.info(`aggregateDirectionsLog: ${destinations.length} barrios sobre threshold ${threshold}, ${snap.size} hits totales en ${hours}h`);
+    } catch (e) {
+      logger.error(`aggregateDirectionsLog error: ${e.message}`);
+    }
   }
 );
