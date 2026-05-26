@@ -113,7 +113,14 @@ function computeConfidence({ bus, etaSource, trafficApplied, calibSource }) {
     conf += delta < TRAFFIC_DELTA_THRESHOLD_SEC ? 0.3 : 0.15;
   }
 
-  if (calibSource === "exact" || calibSource === "parent") conf += 0.2;
+  // calibSource viene con prefijo de source A/B (Sprint Unif 19):
+  // "bq:exact" | "firestore:parent" | "bq:grandpa" | "none" | etc.
+  // Tomamos el level después del ":". Backward compat: si no hay
+  // prefijo (formato legacy "exact"), funciona igual.
+  const calibLevel = typeof calibSource === "string"
+    ? (calibSource.includes(":") ? calibSource.split(":")[1] : calibSource)
+    : null;
+  if (calibLevel === "exact" || calibLevel === "parent") conf += 0.2;
   else conf += 0.05;
 
   return Math.min(1.0, Number(conf.toFixed(3)));

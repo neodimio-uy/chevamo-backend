@@ -355,6 +355,29 @@ const statsBusCountCache = new RequestCache(30_000, "stats-bus-count");
 const statsTopLinesCache       = new RequestCache(60_000, "stats-top-lines");
 const statsTopDestinationsCache = new RequestCache(60_000, "stats-top-destinations");
 const statsSummaryCache        = new RequestCache(30_000, "stats-summary");
+// punctuality: cron diario → cache 1h (refresh entre runs no aporta nada).
+const statsPunctualityCache    = new RequestCache(3_600_000, "stats-punctuality");
+
+// ─────────────────────────────────────────────────────────────────
+// Helper: Set de líneas ACTIVAS — las que tienen al menos un bus en
+// el feed live (busesCache key "all"). Se usa para:
+//   1. /stats/summary `lines`: contar líneas con servicio AHORA (no
+//      todas las del catálogo GTFS, que incluye estacionales/inactivas).
+//   2. /stats/top-reported-lines: filtrar el ranking comunitario para
+//      no mostrar líneas que reportaron en pasado pero hoy no circulan.
+//
+// Devuelve `null` si la cache está vacía (cold start o pre-warmer) —
+// el caller debe degradar gracefully (no filtrar, devolver original).
+function getActiveLineSet() {
+  const entry = busesCache.get("all");
+  if (!entry || !entry.data || !Array.isArray(entry.data)) return null;
+  const set = new Set();
+  for (const bus of entry.data) {
+    const line = String(bus.line || "").trim();
+    if (line) set.add(line);
+  }
+  return set;
+}
 
 // ─────────────────────────────────────────────────────────────────
 // Google Distance Matrix con tráfico (enriquecimiento del ETA)
@@ -1840,7 +1863,15 @@ exports.api = onRequest({
     const limitRaw = parseInt(req.query.limit, 10);
     const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 10, 1), 50);
     try {
-      const entry = await statsTopLinesCache.dedupe(`limit:${limit}`, async () => {
+      // El cache key incluye `active:<presence>` para que el filtro
+      // active/no-active no contamine entradas (cuando la cache buses
+      // está fría y devolvemos sin filtrar, no queremos cachear ese
+      // resultado como si fuera el filtrado).
+      const activeLines = getActiveLineSet();
+      const cacheKey = activeLines
+        ? `limit:${limit}:active`
+        : `limit:${limit}:nofilter`;
+      const entry = await statsTopLinesCache.dedupe(cacheKey, async () => {
         const doc = await admin.firestore()
           .collection("top_reported_lines_cache")
           .doc("snapshot")
@@ -1850,10 +1881,15 @@ exports.api = onRequest({
         }
         const data = doc.data() || {};
         const all = Array.isArray(data.lines) ? data.lines : [];
+        // Filtrar a líneas con servicio AHORA. Si la cache buses está
+        // vacía (cold start), no filtramos — degradación gracefully.
+        const filtered = activeLines
+          ? all.filter(item => activeLines.has(String(item.line || "").trim()))
+          : all;
         return {
           hours: data.hours || 24,
           generatedAt: data.generatedAt ? data.generatedAt.toMillis() : null,
-          lines: all.slice(0, limit),
+          lines: filtered.slice(0, limit),
         };
       });
       return sendCachedWrapped(req, res, entry, { source: "firestore" });
@@ -1933,25 +1969,27 @@ exports.api = onRequest({
           .where("updatedAt", ">=", cutoff)
           .get();
         const communityReportsNow = reportsSnap.size;
-        // Paradas: count del bundled stop_lines.json (ya cargado en memoria).
-        const stops = Object.keys(stopLines).length;
-        // Líneas únicas: derivar de stop_lines (cada parada tiene array de líneas).
-        const lineSet = new Set();
-        for (const arr of Object.values(stopLines)) {
-          if (Array.isArray(arr)) {
-            for (const l of arr) lineSet.add(String(l).trim());
+        // Líneas ACTIVAS: las que tienen al menos un bus en el feed
+        // live (busesCache). Fallback al catálogo estático stop_lines
+        // solo si la cache aún no se llenó (cold start). El catálogo
+        // sobrecuenta (incluye líneas estacionales / nocturnas no en
+        // servicio), así que preferimos el feed live cuando hay.
+        const activeLines = getActiveLineSet();
+        let lines;
+        if (activeLines) {
+          lines = activeLines.size;
+        } else {
+          const lineSet = new Set();
+          for (const arr of Object.values(stopLines)) {
+            if (Array.isArray(arr)) {
+              for (const l of arr) lineSet.add(String(l).trim());
+            }
           }
+          lines = lineSet.size;
         }
-        const lines = lineSet.size;
-        // Empresas Mvd urbanas conocidas (whitelist del cliente — alineado
-        // con CompanyColors.swift). Si en el futuro hay un registry server-side
-        // unificado, leer de ahí.
-        const companies = 4; // CUTCSA, COETC, COMESA, UCOT
         return {
           busesNow,
-          stops,
           lines,
-          companies,
           communityReportsNow,
           generatedAt: Date.now(),
         };
@@ -1960,6 +1998,290 @@ exports.api = onRequest({
     } catch (e) {
       logger.error(`/stats/summary error: ${e.message}`);
       return fail(res, "STATS_UNAVAILABLE", "No se pudo computar el resumen");
+    }
+  }
+
+  // ── GET /stats/punctuality ── (público, sin auth)
+  //
+  // Lee snapshots diarios producidos por el cron `aggregatePunctuality`.
+  // Parámetros:
+  //   - range: "24h" (default, ayer completo) | "7d" (últimos 7 días UY)
+  //   - company: "Todas" (default) | "CUTCSA" | "COETC" | "COMESA" | "UCOT"
+  //   - date: opcional YYYY-MM-DD (override range, sirve para comparar
+  //     días específicos; ignora company-aware merging).
+  //
+  // En `range=7d` se agregan 7 docs sumando counts y recalculando pcts.
+  // Doc viejo (sin byCompany) se degrada a "Todas".
+  if (url.startsWith("/stats/punctuality") && req.method === "GET") {
+    const dateParam = String(req.query.date || "").trim();
+    const rangeRaw = String(req.query.range || "24h").toLowerCase();
+    const range = rangeRaw === "7d" ? "7d" : "24h";
+    const companyRaw = String(req.query.company || "Todas").trim();
+    const allowedCompanies = new Set(["Todas", "CUTCSA", "COETC", "COMESA", "UCOT"]);
+    const company = allowedCompanies.has(companyRaw) ? companyRaw : "Todas";
+    try {
+      const db = admin.firestore();
+      const dates = (() => {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) return [dateParam];
+        // Construir las fechas UY: ayer, antier, etc.
+        const now = new Date();
+        const uy = new Date(now.toLocaleString("en-US", { timeZone: "America/Montevideo" }));
+        const N = range === "7d" ? 7 : 1;
+        const out = [];
+        for (let i = 1; i <= N; i++) {
+          const d = new Date(uy);
+          d.setDate(d.getDate() - i);
+          const y = d.getFullYear();
+          const m = String(d.getMonth() + 1).padStart(2, "0");
+          const dd = String(d.getDate()).padStart(2, "0");
+          out.push(`${y}-${m}-${dd}`);
+        }
+        return out;
+      })();
+
+      const cacheKey = `range:${range}:company:${company}:dates:${dates.join(",")}`;
+      const cached = statsPunctualityCache.get(cacheKey);
+      if (cached) return sendCachedWrapped(req, res, cached, { source: "firestore" });
+
+      // Fetch todos los docs en paralelo. Los que no existen quedan en `null`.
+      const snaps = await Promise.all(
+        dates.map(d => db.collection("punctuality_daily").doc(d).get())
+      );
+      const docs = snaps.map((s, i) => s.exists ? { date: dates[i], data: s.data() } : null);
+      const validDocs = docs.filter(Boolean);
+
+      if (validDocs.length === 0) {
+        return ok(res, {
+          available: false,
+          range,
+          company,
+          requestedDates: dates,
+        }, { source: "firestore" });
+      }
+
+      // Extrae el subset (hours + totals) que corresponde al filtro
+      // company de un solo doc. Si el doc viejo no tiene byCompany y
+      // pidieron una empresa específica, devolvemos null para indicar
+      // que ese día no se puede desagregar.
+      const subsetForCompany = (data, companyKey) => {
+        if (companyKey === "Todas") {
+          return { hours: data.hours || [], totals: data.totals || {} };
+        }
+        const bc = data.byCompany && data.byCompany[companyKey];
+        if (!bc) return null; // doc legacy sin breakdown
+        return { hours: bc.hours || [], totals: bc.totals || {} };
+      };
+
+      const subsets = validDocs
+        .map(d => subsetForCompany(d.data, company))
+        .filter(Boolean);
+
+      if (subsets.length === 0) {
+        return ok(res, {
+          available: false,
+          range,
+          company,
+          requestedDates: dates,
+          reason: "company-not-available-in-docs",
+        }, { source: "firestore" });
+      }
+
+      // Merge: sumar counts por bucket y recalcular pcts.
+      const sparseThreshold = validDocs[0].data.sparseBucketThreshold || 50;
+      const mergedHours = Array.from({ length: 24 }, (_, h) => ({
+        h, early: 0, onTime: 0, late: 0, unmatched: 0, total: 0,
+      }));
+      const mergedTotals = { matched: 0, unmatched: 0, early: 0, onTime: 0, late: 0 };
+      for (const s of subsets) {
+        const hours = Array.isArray(s.hours) ? s.hours : [];
+        for (const b of hours) {
+          const h = Number(b.h);
+          if (!Number.isFinite(h) || h < 0 || h > 23) continue;
+          mergedHours[h].early    += b.early || 0;
+          mergedHours[h].onTime   += b.onTime || 0;
+          mergedHours[h].late     += b.late || 0;
+          mergedHours[h].unmatched += b.unmatched || 0;
+          mergedHours[h].total    += b.total || 0;
+        }
+        const t = s.totals || {};
+        mergedTotals.matched   += t.matched || 0;
+        mergedTotals.unmatched += t.unmatched || 0;
+        mergedTotals.early     += t.early || 0;
+        mergedTotals.onTime    += t.onTime || 0;
+        mergedTotals.late      += t.late || 0;
+      }
+      // En 7d el threshold sparse escala con los días disponibles —
+      // SPARSE × N días. Así una hora con 5 muestras × 7 días = 35
+      // sigue sparse, pero 50 × 7 = 350 ya no.
+      const effectiveSparse = sparseThreshold * subsets.length;
+      for (const b of mergedHours) {
+        if (b.total >= effectiveSparse) {
+          b.earlyPct  = b.early / b.total;
+          b.onTimePct = b.onTime / b.total;
+          b.latePct   = b.late / b.total;
+          b.sparse = false;
+        } else {
+          b.earlyPct = null;
+          b.onTimePct = null;
+          b.latePct = null;
+          b.sparse = true;
+        }
+      }
+      mergedTotals.onTimePct = mergedTotals.matched > 0
+        ? mergedTotals.onTime / mergedTotals.matched
+        : null;
+
+      const payload = {
+        available: true,
+        range,
+        company,
+        days: subsets.length,
+        requestedDates: dates,
+        usedDates: validDocs.map(d => d.date),
+        hours: mergedHours,
+        totals: mergedTotals,
+        onTimeThresholdMin: validDocs[0].data.onTimeThresholdMin,
+        matchWindowMin: validDocs[0].data.matchWindowMin,
+        sparseBucketThreshold: sparseThreshold,
+        effectiveSparseBucketThreshold: effectiveSparse,
+        updatedAt: validDocs[0].data.updatedAt ? validDocs[0].data.updatedAt.toMillis() : null,
+      };
+      const entry = statsPunctualityCache.set(cacheKey, payload);
+      return sendCachedWrapped(req, res, entry, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/stats/punctuality error: ${e.message}`);
+      return fail(res, "STATS_UNAVAILABLE", "No se pudo cargar puntualidad");
+    }
+  }
+
+  // ── GET /stats/top-punctual-lines ── (público, sin auth)
+  //
+  // Top N líneas con mejor puntualidad. Default ventana: última hora UY
+  // (rolling 60min). Lee el doc `punctuality_hourly/latest` producido
+  // por el cron `aggregatePunctualityHourly` (cada 10 min).
+  //
+  // Params:
+  //   - limit (default 5, max 20)
+  //   - minSamples: mínimo de arribos para considerar la línea (default
+  //     adaptativo: 15 para hourly, 50 para daily)
+  //   - window: "1h" (default) | "1d" (lee del doc diario)
+  if (url.startsWith("/stats/top-punctual-lines") && req.method === "GET") {
+    const limitRaw = parseInt(req.query.limit, 10);
+    const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 5, 1), 20);
+    const windowParam = String(req.query.window || "1h").toLowerCase();
+    const window = windowParam === "1d" ? "1d" : "1h";
+    const minSamplesRaw = parseInt(req.query.minSamples, 10);
+    const defaultMinSamples = window === "1h" ? 15 : 50;
+    const minSamples = Math.max(
+      Number.isFinite(minSamplesRaw) ? minSamplesRaw : defaultMinSamples,
+      3
+    );
+    try {
+      const db = admin.firestore();
+      let docRef;
+      let dateKey;
+      if (window === "1h") {
+        docRef = db.collection("punctuality_hourly").doc("latest");
+        dateKey = "hourly";
+      } else {
+        const now = new Date();
+        const uy = new Date(now.toLocaleString("en-US", { timeZone: "America/Montevideo" }));
+        uy.setDate(uy.getDate() - 1);
+        const y = uy.getFullYear();
+        const m = String(uy.getMonth() + 1).padStart(2, "0");
+        const d = String(uy.getDate()).padStart(2, "0");
+        dateKey = `${y}-${m}-${d}`;
+        docRef = db.collection("punctuality_daily").doc(dateKey);
+      }
+      const cacheKey = `top-punctual:${window}:${limit}:${minSamples}:${dateKey}`;
+      const cached = statsPunctualityCache.get(cacheKey);
+      if (cached) return sendCachedWrapped(req, res, cached, { source: "firestore" });
+
+      const docSnap = await docRef.get();
+      if (!docSnap.exists) {
+        return ok(res, { available: false, window, lines: [] }, { source: "firestore" });
+      }
+      const data = docSnap.data();
+      const byLine = data.byLine || {};
+      const lines = Object.entries(byLine)
+        .map(([line, b]) => ({
+          line,
+          matched: b.matched || 0,
+          onTime: b.onTime || 0,
+          early: b.early || 0,
+          late: b.late || 0,
+          onTimePct: b.onTimePct,
+        }))
+        .filter(l => l.matched >= minSamples && l.onTimePct != null)
+        .sort((a, b) => b.onTimePct - a.onTimePct)
+        .slice(0, limit);
+
+      const payload = {
+        available: true,
+        window,
+        minSamples,
+        updatedAt: data.updatedAt ? data.updatedAt.toMillis() : null,
+        lines,
+      };
+      if (lines.length === 0) {
+        return ok(res, payload, { source: "firestore" });
+      }
+      const entry = statsPunctualityCache.set(cacheKey, payload);
+      return sendCachedWrapped(req, res, entry, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/stats/top-punctual-lines error: ${e.message}`);
+      return fail(res, "STATS_UNAVAILABLE", "No se pudo cargar ranking de líneas puntuales");
+    }
+  }
+
+  // ── GET /stats/top-stops ── (público, sin auth)
+  //
+  // Top N paradas con más actividad de usuarios (queries a /upcoming) en
+  // las últimas N horas. Query directa a BigQuery `eta_requests`.
+  //
+  // Cache 5 min — la actividad cambia lento y queremos amortizar el costo
+  // BQ (cada query escanea ~MB de datos).
+  if (url.startsWith("/stats/top-stops") && req.method === "GET") {
+    const limitRaw = parseInt(req.query.limit, 10);
+    const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 5, 1), 20);
+    const hoursRaw = parseInt(req.query.hours, 10);
+    const hours = Math.min(Math.max(Number.isFinite(hoursRaw) ? hoursRaw : 24, 1), 168);
+    try {
+      const cacheKey = `top-stops:${limit}:${hours}`;
+      const cached = statsPunctualityCache.get(cacheKey);
+      if (cached) return sendCachedWrapped(req, res, cached, { source: "bigquery" });
+
+      const { BigQuery } = require("@google-cloud/bigquery");
+      const bq = new BigQuery({ projectId: process.env.GCLOUD_PROJECT || "vamo-dbad6" });
+      const dsLocation = process.env.BQ_TELEMETRY_LOCATION || "southamerica-east1";
+      const dsName = process.env.BQ_TELEMETRY_DATASET || "vamo_telemetry";
+
+      const query = `
+        SELECT stopId, COUNT(*) AS hits
+        FROM \`${process.env.GCLOUD_PROJECT || "vamo-dbad6"}.${dsName}.eta_requests\`
+        WHERE ts > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${hours} HOUR)
+          AND stopId IS NOT NULL AND stopId != ''
+        GROUP BY stopId
+        ORDER BY hits DESC
+        LIMIT ${limit}
+      `;
+      const [job] = await bq.createQueryJob({ query, location: dsLocation, useLegacySql: false });
+      const [rows] = await job.getQueryResults();
+
+      // Resolver stopName desde catálogo bundled si existe. stop-lines.json
+      // no tiene nombres — usamos stop-schedules.json o el catálogo IMM.
+      // Por ahora exponemos solo stopId; el cliente puede formatear "Parada N".
+      const stops = rows.map(r => ({
+        stopId: String(r.stopId),
+        hits: Number(r.hits),
+      }));
+
+      const payload = { hours, generatedAt: Date.now(), stops };
+      const entry = statsPunctualityCache.set(cacheKey, payload);
+      return sendCachedWrapped(req, res, entry, { source: "bigquery" });
+    } catch (e) {
+      logger.error(`/stats/top-stops error: ${e.message}`);
+      return fail(res, "STATS_UNAVAILABLE", "No se pudo cargar ranking de paradas");
     }
   }
 
@@ -4912,6 +5234,72 @@ exports.aggregateEtaFactors = onSchedule(
       buckets: factors,
     });
     logger.info(`aggregateEtaFactors: ${Object.keys(factors).length} buckets desde ${snap.size} obs / ${perUserCount.size} users`);
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────
+// Sprint Unif 19: agregador BQ-driven (A/B safe con el de arriba)
+// ─────────────────────────────────────────────────────────────────
+//
+// Coexiste con `aggregateEtaFactors` (Firestore). Lee del Telemetry Hub
+// Fase A (BigQuery) y joinea `eta_requests.buses[]` ↔ `bus_arrivals`
+// para tener (predicted, actual) por bus. Escribe a doc separado
+// `system/eta_calibration_factors_bq`. El lookup en
+// `eta-calibrator-lookup.js` prueba BQ first, fallback al Firestore.
+// Después de validar que los factors BQ son al menos igual de buenos
+// (1-2 meses de prod), se puede descomisar el aggregator Firestore.
+
+const etaBqAggregator = require("./lib/eta-bq-aggregator");
+
+exports.aggregateEtaFactorsFromBq = onSchedule(
+  {
+    schedule: "every 6 hours",
+    memory: "512MiB",
+    timeoutSeconds: 540,
+    // BigQuery cliente necesita auth via default service account de la
+    // function — typically `<project>@appspot.gserviceaccount.com` o el
+    // que Cloud Functions Gen 2 use. Sin permisos BQ, fail clean (loguea
+    // y NO sobrescribe el doc, ver `runAndPersist`).
+  },
+  async () => {
+    await etaBqAggregator.runAndPersist({ admin });
+  }
+);
+
+// Puntualidad diaria — corre 5 AM UY (8 AM UTC) para tener el día UY
+// anterior completo en BQ. Memoria alta porque carga stop-schedules.json
+// (~24MB) e indexa 4901 paradas × N líneas en memoria.
+const punctualityAggregator = require("./lib/punctuality-aggregator");
+
+exports.aggregatePunctuality = onSchedule(
+  {
+    schedule: "0 8 * * *",   // 08:00 UTC = 05:00 UY (UTC-3)
+    timeZone: "Etc/UTC",
+    memory: "1GiB",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    await punctualityAggregator.runAndPersist({
+      admin,
+      getStopSchedules,
+    });
+  }
+);
+
+// Variante horaria: corre cada 10 min con ventana móvil de 60 min.
+// Escribe `punctuality_hourly/latest` (doc único sobrescrito). Alimenta
+// el ranking "Líneas más puntuales — última hora" en el TV mode.
+exports.aggregatePunctualityHourly = onSchedule(
+  {
+    schedule: "every 10 minutes",
+    memory: "1GiB",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    await punctualityAggregator.runAndPersistHourly({
+      admin,
+      getStopSchedules,
+    });
   }
 );
 
