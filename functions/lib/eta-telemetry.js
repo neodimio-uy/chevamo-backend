@@ -43,6 +43,7 @@
 
 const { PubSub } = require("@google-cloud/pubsub");
 const { logger } = require("firebase-functions");
+const { computeBusUid } = require("./bus-uid");
 
 const TOPIC_NAME = process.env.ETA_TELEMETRY_TOPIC || null;
 const SAMPLE_RATE = parseFloat(process.env.ETA_TELEMETRY_SAMPLE_RATE || "1.0");
@@ -143,6 +144,8 @@ function buildRequestEvent({
     const tel = bus._etaTelemetry || {};
     return {
       busId: String(bus.busId || bus.id || bus.code || ""),
+      // Canonical busUid (cross-empresa). Ver lib/bus-uid.js.
+      busUid: bus.busUid || computeBusUid(bus),
       line: String(bus.line || ""),
       etaRaw: typeof bus.eta === "number" ? bus.eta : null,
       googleEtaSec: typeof bus.googleEtaSec === "number" ? bus.googleEtaSec : null,

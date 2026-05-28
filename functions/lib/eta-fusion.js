@@ -34,6 +34,7 @@ const calibrator = require("./eta-calibrator-lookup");
 const positionFuser = require("./position-fuser");
 const sourceConfidence = require("./source-confidence");
 const clusterer = require("./community-clusterer");
+const { computeBusUid } = require("./bus-uid");
 
 /** Cota inferior absoluta del etaFinal — buses dentro del minuto siguiente
  *  igual se reportan como "1 min" (Math.max(1, …) en el stabilizer). */
@@ -245,9 +246,12 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
   let etaFinalSec = baseEtaSec * multiplier;
   etaFinalSec = Math.max(MIN_ETA_SEC, etaFinalSec);
 
-  // Stabilizer: por (stopId, busId). Devuelve minutos enteros.
-  const busId = bus.busId || bus.id || bus.code || `${bus.line}:${bus.position || ""}`;
-  const stabKey = `${stopId}:${busId}`;
+  // Stabilizer: key por (stopId, busUid). Pre-Unif 21 usaba solo busId,
+  // pero CUTCSA #63 ≠ COETC #63 ≠ UCOT #63 son buses físicos distintos
+  // que numeran independiente. Sin busUid, los estados ETA se cruzaban
+  // entre empresas. Ver feedback_canonical_bus_uid.md.
+  const busUid = bus.busUid || computeBusUid(bus) || `${bus.line}:${bus.position || ""}`;
+  const stabKey = `${stopId}:${busUid}`;
   const etaFinalMin = stabilizer.stabilize({ key: stabKey, etaFinalSec, now });
 
   // Etiqueta de fuente final. Si traffic se aplicó, lo señalamos. Si hay
@@ -278,6 +282,10 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
 
   const result = {
     ...bus,
+    // Canonical busUid expuesto al cliente. UpcomingBus pre-fuseBus viene
+    // del feed IMM sin busUid, lo computamos acá para que iOS+PWA hagan
+    // lookups sin colisiones cross-empresa. Ver feedback_canonical_bus_uid.md.
+    busUid,
     ...(locationOverride && { location: locationOverride }),
     // Devolvemos segundos: el cliente convierte a minutos si necesita
     // (consistente con `etaRaw` y `googleEtaSec`). El stabilizer ya redondeó

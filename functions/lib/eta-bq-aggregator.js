@@ -69,6 +69,11 @@ WITH predictions AS (
     r.uyHourBand AS hourBand,
     r.uyDayKind  AS dayKind,
     b.busId,
+    -- Match key Unif 21+: canonical busUid si está presente, sino
+    -- fallback al hack legacy CONCAT('imm-stm:', busId) para compat
+    -- con data anterior al rollout busUid (~2026-05-25). Después de
+    -- ~14 días de data nueva podemos eliminar el fallback.
+    COALESCE(b.busUid, CONCAT('imm-stm:', b.busId)) AS match_key,
     b.line,
     b.etaRaw AS predicted_sec
   FROM ${ds}.eta_requests r,
@@ -84,6 +89,8 @@ WITH predictions AS (
 arrivals AS (
   SELECT
     busId,
+    -- Mismo fallback: busUid (nuevo) o busId legacy con prefijo.
+    COALESCE(busUid, busId) AS match_key,
     stopId,
     ts AS actual_arrival_ts
   FROM ${ds}.bus_arrivals
@@ -99,19 +106,19 @@ matched AS (
     TIMESTAMP_DIFF(a.actual_arrival_ts, p.request_ts, SECOND) AS actual_sec
   FROM predictions p
   JOIN arrivals a
-    -- bus_arrivals.busId tiene prefijo del feed source ("imm-stm:NNN"),
-    -- mientras que eta_requests.buses[].busId es solo el número crudo
-    -- ("NNN"). Concat para que matcheen. Alternativa: cambiar el writer
-    -- de uno de los dos para uniformar — preferimos hacerlo acá para
-    -- no impactar otros consumers downstream.
-    ON CONCAT('imm-stm:', p.busId) = a.busId
+    -- JOIN por canonical busUid (con fallback backward-compat).
+    -- Pre-Unif 21 esto era CONCAT('imm-stm:', busId) — pero los busId
+    -- colisionan cross-empresa (CUTCSA #63 ≠ COETC #63), por lo que
+    -- ese JOIN matcheaba arrivals de OTRAS empresas y contaminaba la
+    -- calibración. busUid incluye company y resuelve la colisión.
+    ON p.match_key = a.match_key
     AND p.stopId = a.stopId
     AND a.actual_arrival_ts > p.request_ts
     AND a.actual_arrival_ts < TIMESTAMP_ADD(p.request_ts, INTERVAL 30 MINUTE)
-  -- Tomar el arrival más cercano post-request por (busId, stopId, request_ts).
+  -- Tomar el arrival más cercano post-request por (match_key, stopId, request_ts).
   -- Sin esto, si un bus arriva 2 veces (variantes que solapan), contamos doble.
   QUALIFY ROW_NUMBER() OVER (
-    PARTITION BY p.request_ts, p.busId, p.stopId
+    PARTITION BY p.request_ts, p.match_key, p.stopId
     ORDER BY a.actual_arrival_ts
   ) = 1
 )

@@ -1,6 +1,7 @@
 [
   { "name": "ts", "type": "TIMESTAMP", "mode": "REQUIRED", "description": "Timestamp del evento detectado (server time)." },
-  { "name": "busId", "type": "STRING", "mode": "REQUIRED", "description": "ID interno del bus." },
+  { "name": "busId", "type": "STRING", "mode": "REQUIRED", "description": "ID interno del bus. LEGACY — usar busUid para lookups/JOINs." },
+  { "name": "busUid", "type": "STRING", "mode": "NULLABLE", "description": "Canonical busUid cross-empresa: 'feedSource:company:busId:lineVariantId'. Resuelve colisión 203 busIds entre cooperativas. Unif 21 — NULLABLE durante migration." },
   { "name": "line", "type": "STRING", "mode": "REQUIRED", "description": "Línea del bus." },
   { "name": "lineVariantId", "type": "STRING", "mode": "NULLABLE", "description": "Variante/ramal si está disponible." },
   { "name": "destination", "type": "STRING", "mode": "NULLABLE", "description": "Headsign al momento del evento." },

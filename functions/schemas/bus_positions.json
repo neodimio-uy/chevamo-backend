@@ -1,6 +1,7 @@
 [
   { "name": "ts", "type": "TIMESTAMP", "mode": "REQUIRED", "description": "Timestamp del snapshot (server time)." },
-  { "name": "busId", "type": "STRING", "mode": "REQUIRED", "description": "ID interno del bus (formato 'imm-stm:NNNN' o solo NNNN)." },
+  { "name": "busId", "type": "STRING", "mode": "REQUIRED", "description": "ID interno del bus (formato 'imm-stm:NNNN' o solo NNNN). LEGACY — usar busUid para lookups/JOINs." },
+  { "name": "busUid", "type": "STRING", "mode": "NULLABLE", "description": "Canonical busUid cross-empresa: 'feedSource:company:busId:lineVariantId'. Resuelve colisión 203 busIds entre cooperativas. Unif 21 — NULLABLE durante migration, REQUIRED después." },
   { "name": "line", "type": "STRING", "mode": "REQUIRED", "description": "Identificador de línea (ej '144', 'D1', 'CA1')." },
   { "name": "lineVariantId", "type": "STRING", "mode": "NULLABLE", "description": "ID de variante/ramal cuando IMM lo provee." },
   { "name": "destination", "type": "STRING", "mode": "NULLABLE", "description": "Headsign del trip ('CENTRO', 'CERRO', etc)." },

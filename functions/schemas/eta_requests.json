@@ -18,7 +18,8 @@
     "mode": "REPEATED",
     "description": "Buses devueltos en la respuesta, uno por elemento.",
     "fields": [
-      { "name": "busId", "type": "STRING", "mode": "NULLABLE" },
+      { "name": "busId", "type": "STRING", "mode": "NULLABLE", "description": "LEGACY — usar busUid para lookups/JOINs." },
+      { "name": "busUid", "type": "STRING", "mode": "NULLABLE", "description": "Canonical busUid cross-empresa: 'feedSource:company:busId:lineVariantId'. Resuelve colisión 203 busIds entre cooperativas. Unif 21." },
       { "name": "line", "type": "STRING", "mode": "NULLABLE" },
       { "name": "etaRaw", "type": "INT64", "mode": "NULLABLE", "description": "ETA crudo IMM en segundos." },
       { "name": "googleEtaSec", "type": "INT64", "mode": "NULLABLE", "description": "ETA Google Distance Matrix en segundos (si fue computado)." },

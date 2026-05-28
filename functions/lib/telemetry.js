@@ -24,6 +24,7 @@
 
 const { PubSub } = require("@google-cloud/pubsub");
 const { logger } = require("firebase-functions");
+const { computeBusUid } = require("./bus-uid");
 
 const DEFAULT_SAMPLE_RATE = parseFloat(
   process.env.TELEMETRY_SAMPLE_RATE || "1.0"
@@ -132,6 +133,8 @@ function buildPositionEvent(bus, ctx = {}) {
   return {
     ts: now.toISOString(),
     busId: String(bus.id || bus.busId || ""),
+    // Canonical busUid (cross-empresa). Ver lib/bus-uid.js.
+    busUid: bus.busUid || computeBusUid(bus),
     line: String(bus.trip?.routeShortName || bus.trip?.routeId || bus.line || ""),
     lineVariantId: bus.trip?.tripId ? String(bus.trip.tripId) : null,
     destination: bus.trip?.headsign || null,
@@ -139,6 +142,10 @@ function buildPositionEvent(bus, ctx = {}) {
     company: bus.agency?.name || bus.trip?.agencyName || bus.company || null,
     lat: coords.lat,
     lng: coords.lng,
+    // NO incluir `geo` acá: la subscription Pub/Sub→BQ con useTableSchema
+    // no acepta WKT string como GEOGRAPHY → rechaza el mensaje entero.
+    // La columna `geo` se popula con una scheduled query BQ que corre
+    // cada N min sobre rows con `geo IS NULL` (ver scheduled queries).
     speedKmh: typeof coords.speed === "number" ? coords.speed : null,
     feedTs: feedTs ? feedTs.toISOString() : null,
     stalenessSec,
@@ -194,6 +201,8 @@ function buildArrivalEvent({
   return {
     ts: ts.toISOString(),
     busId: String(bus.id || bus.busId || ""),
+    // Canonical busUid (cross-empresa). Ver lib/bus-uid.js.
+    busUid: bus.busUid || computeBusUid(bus),
     line: String(bus.trip?.routeShortName || bus.trip?.routeId || bus.line || ""),
     lineVariantId: bus.trip?.tripId ? String(bus.trip.tripId) : null,
     destination: bus.trip?.headsign || null,

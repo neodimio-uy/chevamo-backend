@@ -9,6 +9,11 @@ const { GeoPointSchema } = require("./bus");
 
 const UpcomingBusSchema = z.object({
   busId:          z.coerce.number().int().min(1).max(10_000_000).optional(),
+  // Canonical UID cross-empresa: `feedSource:company:busId:lineVariantId`.
+  // Se computa server-side (lib/bus-uid.js) y se incluye en la respuesta
+  // para que los clientes hagan lookups sin colisiones. Ver memoria
+  // feedback_canonical_bus_uid.md.
+  busUid:         z.string().trim().max(100).optional(),
   line:           z.string().trim().min(1).max(15),
   companyName:    z.string().trim().max(50).optional(),
   origin:         z.string().trim().max(200).nullable().optional(),

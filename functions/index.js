@@ -31,8 +31,25 @@ const zlib = require("zlib");
 // HTTP keep-alive — reusa conexiones TCP+TLS a upstreams (IMM, AMBA, Lisboa, Google APIs).
 // Ahorra ~100-300ms de handshake por call. Como axios cachea require(), todos los adapters
 // que hacen `require("axios")` heredan estos defaults.
+//
+// CA extra Abitab+Certum: el cert SSL del IMM (mvdapi-auth.montevideo.gub.uy,
+// emitido por Abitab DV) NO envía la cadena intermedia y Node 24 ya no hace
+// AIA fetching. Sin estos certs en el trust store, axios rechaza con
+// `UNABLE_TO_VERIFY_LEAF_SIGNATURE` (causa del outage 2026-05-27).
+// Bundle pinneado en functions/certs/abitab-chain.pem (Abitab DV intermediate
+// + Certum Global Services CA SHA2). Próxima expiración: may-2027.
+const tls = require("tls");
+let immChainCA = null;
+try {
+  immChainCA = fs.readFileSync(path.join(__dirname, "certs/abitab-chain.pem"));
+} catch (e) {
+  // No bloquear arranque si el archivo no está — solo se cae en runtime
+  // cuando intente conectar al IMM. Útil para tests locales sin certs.
+  console.warn("[boot] abitab-chain.pem no encontrado, conexiones IMM van a fallar:", e.message);
+}
+const caBundle = immChainCA ? [...tls.rootCertificates, immChainCA] : undefined;
 const keepAliveHttpAgent  = new http.Agent({ keepAlive: true,  maxSockets: 50, maxFreeSockets: 10, timeout: 60_000 });
-const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 60_000 });
+const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 60_000, ca: caBundle });
 axios.defaults.httpAgent  = keepAliveHttpAgent;
 axios.defaults.httpsAgent = keepAliveHttpsAgent;
 
@@ -71,6 +88,7 @@ const arrivalsDetector = require("./lib/arrivals-detector");
 const apiKeys = require("./lib/api-keys");
 const immStmAdapter = require("./lib/adapters/imm-stm");
 const communityCache = require("./lib/community-cache");
+const communityMerger = require("./lib/community-merger");
 const { ack } = require("./lib/schemas/ack");
 const {
   adaptCurrent: adaptWeatherCurrent,
@@ -356,7 +374,11 @@ const statsTopLinesCache       = new RequestCache(60_000, "stats-top-lines");
 const statsTopDestinationsCache = new RequestCache(60_000, "stats-top-destinations");
 const statsSummaryCache        = new RequestCache(30_000, "stats-summary");
 // punctuality: cron diario → cache 1h (refresh entre runs no aporta nada).
-const statsPunctualityCache    = new RequestCache(3_600_000, "stats-punctuality");
+// 5 min TTL — el cron hourly corre cada 10 min y el daily cada 24h.
+// 1h era demasiado: cualquier cambio en el doc tardaba hasta 1h en
+// reflejarse en la gráfica DATA. 5 min es suficiente para amortizar
+// queries Firestore sin perder freshness útil.
+const statsPunctualityCache    = new RequestCache(5 * 60_000, "stats-punctuality");
 
 // ─────────────────────────────────────────────────────────────────
 // Helper: Set de líneas ACTIVAS — las que tienen al menos un bus en
@@ -672,6 +694,9 @@ function sendCachedWrapped(req, res, cacheEntry, meta = {}) {
       ttl: ttlRemaining,
       count: Array.isArray(cacheEntry.data) ? cacheEntry.data.length : undefined,
       version: "1",
+      // Pass-through opcional para flags de pipeline (Función 2 comunidad, etc).
+      // Solo se incluye cuando el caller lo pasa explícito.
+      ...(meta.communityMerge === true && { communityMerge: true }),
     },
   };
   if (body.meta.count === undefined) delete body.meta.count;
@@ -833,6 +858,7 @@ exports.api = onRequest({
     "https://data.chevamo.com.uy",
     "https://admin.chevamo.com.uy",
     "https://status.chevamo.com.uy",
+    "https://agenda.chevamo.com.uy",
     "https://vamo-dbad6.web.app",
     /^http:\/\/localhost(:\d+)?$/,
     /^http:\/\/127\.0\.0\.1(:\d+)?$/,
@@ -905,10 +931,62 @@ exports.api = onRequest({
     return handleAdminBriefing(req, res);
   }
 
+  // ── helpers locales para `/buses` y `/buses/bylines` (Función 2 comunidad) ──
+  //
+  // `applyCommunityMergeFlag` envuelve el merge IMM↔Comunidad detrás del
+  // flag de env `COMMUNITY_IN_GLOBAL_BUSES`. Cuando el flag está OFF (default)
+  // pasa la lista IMM tal cual y devuelve `stats: null`. Cuando ON, lee el
+  // community-cache (in-memory TTL 30s, sin Firestore hit caliente), llama
+  // al merger + filter, loggea telemetría y devuelve `{ buses, stats }`.
+  //
+  // `buildBusesEntry` reconstruye un entry de cache con json/etag recomputados
+  // sobre la lista mergeada — patrón idéntico al de `/upcoming` para evitar
+  // 304 con body que ya cambió.
+  async function applyCommunityMergeFlag(immBuses, req) {
+    if (process.env.COMMUNITY_IN_GLOBAL_BUSES !== "true") {
+      return { buses: immBuses, stats: null };
+    }
+    const t0 = Date.now();
+    let clustersByLine;
+    try {
+      clustersByLine = await communityCache.getAllActiveClustersMap(admin);
+    } catch (e) {
+      logger.warn(`community-merge fetch clusters failed: ${e.message}`);
+      return { buses: immBuses, stats: null };
+    }
+    const now = new Date();
+    const { mergedBuses, stats: mergeStats } = communityMerger.mergeImmWithCommunity({
+      immBuses, clustersByLine, now,
+    });
+    const { buses, filteredCount } = communityMerger.filterByCurrentUser({
+      buses: mergedBuses,
+      currentUid: req.auth?.uid,
+      clustersByLine,
+    });
+    const mergeMs = Date.now() - t0;
+    logger.info(`community-merge imm=${mergeStats.immCount} mixed=${mergeStats.mixedCount} pure=${mergeStats.pureCommunityCount} filtered=${filteredCount} hasAuth=${!!req.auth?.uid} ms=${mergeMs}`);
+    return { buses, stats: { ...mergeStats, filteredCount, mergeMs } };
+  }
+
+  function buildBusesEntry(originalEntry, mergedBuses) {
+    const json = JSON.stringify(mergedBuses);
+    const etag = '"' + crypto.createHash("md5").update(json).digest("hex") + '"';
+    return {
+      data: mergedBuses,
+      json,
+      etag,
+      expiry: originalEntry?.expiry,
+      cachedAt: originalEntry?.cachedAt,
+      ttl: originalEntry?.ttl,
+    };
+  }
+
   // ── GET /buses ── (migrado al box sanitizador)
   //
   // Pipeline: fuente raw (IMM o stm-online) → validateList(BusSchema) → ok(data, meta).
   // meta.source indica la fuente efectiva, meta.stale indica si venimos de cache stale.
+  // Si `COMMUNITY_IN_GLOBAL_BUSES=true`, la lista se fusiona con cluster
+  // comunidad post-cache (sin tocar el cache IMM compartido). Ver Función 2.
   if (url === "/buses" && req.method === "GET") {
     // Cold-start guard: en revisión recién deployada el warmer puede estar
     // todavía corriendo su primera fetch. Esperarla (cap 2s) evita que esta
@@ -937,7 +1015,9 @@ exports.api = onRequest({
           if (rejected > 0) logger.info(`/buses: ${rejected} buses rechazados por schema`);
           return valid;
         });
-        return sendCachedWrapped(req, res, entry, { source: "imm" });
+        const { buses: merged, stats } = await applyCommunityMergeFlag(entry.data, req);
+        const finalEntry = stats ? buildBusesEntry(entry, merged) : entry;
+        return sendCachedWrapped(req, res, finalEntry, { source: "imm", ...(stats && { communityMerge: true }) });
       } catch (e) {
         logger.error(`/buses primary error: ${e.message}`);
         // fall through a fallbacks
@@ -952,7 +1032,9 @@ exports.api = onRequest({
       if (rejected > 0) logger.info(`/buses: ${rejected} buses stm-online rechazados`);
       if (valid.length > 0) {
         const entry = busesCache.set("all", valid);
-        return sendCachedWrapped(req, res, entry, { source: "stm-online" });
+        const { buses: merged, stats } = await applyCommunityMergeFlag(entry.data, req);
+        const finalEntry = stats ? buildBusesEntry(entry, merged) : entry;
+        return sendCachedWrapped(req, res, finalEntry, { source: "stm-online", ...(stats && { communityMerge: true }) });
       }
     } catch (e2) {
       logger.error(`/buses stm-online fallback error: ${e2.message}`);
@@ -962,7 +1044,9 @@ exports.api = onRequest({
     const stale = busesCache.getStale("all");
     if (stale) {
       logger.info("Serving stale /buses (primary y fallback cayeron)");
-      return sendCachedWrapped(req, res, stale, { source: "cache", stale: true });
+      const { buses: merged, stats } = await applyCommunityMergeFlag(stale.data, req);
+      const finalEntry = stats ? buildBusesEntry(stale, merged) : stale;
+      return sendCachedWrapped(req, res, finalEntry, { source: "cache", stale: true, ...(stats && { communityMerge: true }) });
     }
 
     return fail(res, "IMM_UNAVAILABLE", "Todas las fuentes de buses no disponibles");
@@ -1243,6 +1327,101 @@ exports.api = onRequest({
     // Etapa 2: cuando llegue notification "payment.updated", fetcheamos el
     // payment de MP y actualizamos `payments/{id}` + `rideRequests/{id}`.
     // Por ahora acknowledge para que MP no reintente.
+    return ok(res, { received: true, action, dataId }, { source: "mercadopago" });
+  }
+
+  // ── POST /agenda/checkout ── (Unif 22 — MP Checkout Pro para Agenda)
+  //
+  // Crea una preference MP UY para que el cliente pague el turno online
+  // (Peluquería Italiana y futuros comercios). Pass-through al comerciante:
+  // el dinero llega directo a la cuenta MP configurada en `MP_ACCESS_TOKEN_UY`.
+  // En la v1, todos los comercios comparten el mismo access token (de prueba);
+  // cuando escalemos, cada comercio tendrá su propio token via marketplace.
+  //
+  // Body: { comercio, servicio, monto, cliente:{nombre,email}, fecha, hora, comentario? }
+  // Devuelve: { initPoint, preferenceId, externalReference }
+  //
+  // Sin auth requerida — el cliente puede ser anónimo (solo necesitamos su email
+  // para que MP le mande comprobante). Anti-spam mínimo via rate-limit existente.
+  if (url === "/agenda/checkout" && req.method === "POST") {
+    const body = req.body || {};
+    const comercio = String(body.comercio || "").trim();
+    const servicio = String(body.servicio || "").trim();
+    const monto = Number(body.monto);
+    const clienteEmail = String(body.cliente?.email || "").trim();
+    const clienteNombre = String(body.cliente?.nombre || "").trim();
+    const fecha = String(body.fecha || "").trim();
+    const hora = String(body.hora || "").trim();
+    const comentario = String(body.comentario || "").trim();
+
+    if (!comercio || !servicio || !monto || monto <= 0 || !clienteEmail || !fecha || !hora) {
+      return fail(res, "INVALID_REQUEST", "Faltan campos: comercio, servicio, monto, cliente.email, fecha, hora");
+    }
+    if (!/^[\w@._+-]+$/.test(clienteEmail) || clienteEmail.length > 200) {
+      return fail(res, "INVALID_REQUEST", "Email inválido");
+    }
+
+    try {
+      const client = mp.getClient("UY", getMpSecrets());
+      const externalReference = `agenda:${comercio}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      const baseUrl = "https://agenda.chevamo.com.uy";
+      const preference = await mp.createPreference(client, {
+        items: [{
+          title: `${servicio} — ${comercio.replace(/-/g, " ")}`,
+          quantity: 1,
+          unit_price: monto,
+        }],
+        payerEmail: clienteEmail,
+        backUrls: {
+          success: `${baseUrl}/${comercio}/pago-exitoso/`,
+          failure: `${baseUrl}/${comercio}/pago-fallido/`,
+          pending: `${baseUrl}/${comercio}/pago-pendiente/`,
+        },
+        externalReference,
+        notificationUrl: `https://api.chevamo.com.uy/agenda/mp-webhook`,
+        metadata: {
+          comercio, servicio, fecha, hora,
+          cliente_nombre: clienteNombre,
+          comentario: comentario || null,
+        },
+      });
+
+      logger.info(`/agenda/checkout preference=${preference.id} ext=${externalReference} mock=${client.mock}`);
+      return ok(res, {
+        initPoint: preference.init_point,
+        sandboxInitPoint: preference.sandbox_init_point || null,
+        preferenceId: preference.id,
+        externalReference,
+      }, { source: "mercadopago", mock: client.mock });
+    } catch (e) {
+      logger.error(`/agenda/checkout error: ${e.message}`);
+      return fail(res, "INTERNAL_ERROR", "No se pudo iniciar el pago");
+    }
+  }
+
+  // ── POST /agenda/mp-webhook ── (MP notifications para Agenda)
+  //
+  // Stub para v1: ack rápido + log. Cuando agreguemos persistencia de
+  // reservas (Firestore `agenda_reservas`), acá hacemos pull del payment
+  // por ID, verificamos status="approved", marcamos la reserva como pagada
+  // y triggeamos email al comerciante con confirmación.
+  if (url === "/agenda/mp-webhook" && req.method === "POST") {
+    const xSignature = req.headers["x-signature"];
+    const xRequestId = req.headers["x-request-id"];
+    const dataId = req.body?.data?.id || req.query?.["data.id"];
+    let secret = null;
+    try { secret = mpWebhookSecret.value(); } catch { secret = null; }
+
+    // Mismo verify que /payments/webhook — el secret es compartido por
+    // proyecto MP, así que vale para ambos endpoints.
+    const valid = mp.verifyWebhookSignature({ secret, xSignature, xRequestId, dataId });
+    if (!valid) {
+      logger.warn(`/agenda/mp-webhook firma inválida data.id=${dataId}`);
+      return fail(res, "FORBIDDEN", "Firma inválida");
+    }
+
+    const action = req.body?.action || req.body?.type || "unknown";
+    logger.info(`/agenda/mp-webhook action=${action} data.id=${dataId}`);
     return ok(res, { received: true, action, dataId }, { source: "mercadopago" });
   }
 
@@ -1749,16 +1928,18 @@ exports.api = onRequest({
     const cacheKey = linesList.slice().sort().join(",");
 
     try {
+      const lineSet = new Set(linesList.map(l => l.trim()));
       // Primero intentar filtrar desde el cache general de /buses si está fresco
       const allBuses = busesCache.get("all");
       if (allBuses && Array.isArray(allBuses.data)) {
-        const lineSet = new Set(linesList.map(l => l.trim()));
-        const filtered = allBuses.data.filter(b => lineSet.has((b.line || "").trim()));
-        logger.info(`/buses/bylines: filtered ${filtered.length}/${allBuses.data.length} desde cache`);
+        const { buses: merged, stats } = await applyCommunityMergeFlag(allBuses.data, req);
+        const filtered = merged.filter(b => lineSet.has((b.line || "").trim()));
+        logger.info(`/buses/bylines: filtered ${filtered.length}/${merged.length} desde cache`);
         return ok(res, filtered, {
           source: "cache",
           cachedAt: allBuses.cachedAt,
           ttl: Math.max(0, Math.floor((allBuses.expiry - Date.now()) / 1000)),
+          ...(stats && { communityMerge: true }),
         });
       }
 
@@ -1776,15 +1957,21 @@ exports.api = onRequest({
         const { valid } = validateList(schemas.BusSchema, r.data, "/buses/bylines");
         return valid;
       });
-      return sendCachedWrapped(req, res, entry, { source: "imm" });
+      const { buses: merged, stats } = await applyCommunityMergeFlag(entry.data, req);
+      if (!stats) return sendCachedWrapped(req, res, entry, { source: "imm" });
+      // Pure-community buses pueden venir de líneas no pedidas — re-filter.
+      const filtered = merged.filter(b => lineSet.has((b.line || "").trim()));
+      const finalEntry = buildBusesEntry(entry, filtered);
+      return sendCachedWrapped(req, res, finalEntry, { source: "imm", communityMerge: true });
     } catch (e) {
       logger.error(`/buses/bylines error: ${e.message}`);
       // Fallback: filtrar desde cache stale
       const stale = busesCache.getStale("all");
       if (stale) {
         const lineSet = new Set(linesList);
-        const filtered = stale.data.filter(b => lineSet.has((b.line || "").trim()));
-        return ok(res, filtered, { source: "cache", stale: true, cachedAt: stale.cachedAt });
+        const { buses: merged, stats } = await applyCommunityMergeFlag(stale.data, req);
+        const filtered = merged.filter(b => lineSet.has((b.line || "").trim()));
+        return ok(res, filtered, { source: "cache", stale: true, cachedAt: stale.cachedAt, ...(stats && { communityMerge: true }) });
       }
       return fail(res, "IMM_UNAVAILABLE");
     }
@@ -2015,18 +2202,85 @@ exports.api = onRequest({
   if (url.startsWith("/stats/punctuality") && req.method === "GET") {
     const dateParam = String(req.query.date || "").trim();
     const rangeRaw = String(req.query.range || "24h").toLowerCase();
-    const range = rangeRaw === "7d" ? "7d" : "24h";
+    // Rangos válidos:
+    //   today → doc `punctuality_today/latest` (día UY corriente hasta última hora cerrada)
+    //   1h    → doc `punctuality_hourly/latest` (rolling 60 min, sin hours[])
+    //   24h   → doc `punctuality_rolling_24h/latest` (desde última hora cerrada, ventana 24h)
+    //   7d    → merge de 7 docs `punctuality_daily/{date}` (ayer y 6 anteriores) + byDay[7]
+    const range = ["today", "1h", "7d"].includes(rangeRaw) ? rangeRaw : "24h";
     const companyRaw = String(req.query.company || "Todas").trim();
     const allowedCompanies = new Set(["Todas", "CUTCSA", "COETC", "COMESA", "UCOT"]);
     const company = allowedCompanies.has(companyRaw) ? companyRaw : "Todas";
     try {
       const db = admin.firestore();
+
+      // Helper para extraer subset por empresa de un doc con byCompany.
+      const subsetForCompany = (data, companyKey) => {
+        if (companyKey === "Todas") {
+          return { hours: data.hours || [], totals: data.totals || {} };
+        }
+        const bc = data.byCompany && data.byCompany[companyKey];
+        if (!bc) return null; // doc sin breakdown (legacy o cron variant)
+        return { hours: bc.hours || [], totals: bc.totals || {} };
+      };
+
+      // ── Rama today / 1h / 24h: un solo doc, sin merge ──
+      if (range === "today" || range === "1h" || range === "24h") {
+        const collectionName = range === "today"
+          ? "punctuality_today"
+          : range === "1h"
+            ? "punctuality_hourly"
+            : "punctuality_rolling_24h";
+        const cacheKey = `range:${range}:company:${company}:single`;
+        const cached = statsPunctualityCache.get(cacheKey);
+        if (cached) return sendCachedWrapped(req, res, cached, { source: "firestore" });
+
+        const snap = await db.collection(collectionName).doc("latest").get();
+        if (!snap.exists) {
+          return ok(res, {
+            available: false,
+            range,
+            company,
+            reason: `no-${collectionName}-doc`,
+          }, { source: "firestore" });
+        }
+        const data = snap.data();
+        const subset = subsetForCompany(data, company);
+        if (!subset) {
+          return ok(res, {
+            available: false,
+            range,
+            company,
+            reason: "company-not-available-in-doc",
+          }, { source: "firestore" });
+        }
+        // today + 24h tienen hours[24]. 1h es agregado total sin buckets.
+        const payload = {
+          available: true,
+          range,
+          company,
+          days: 1,
+          hours: range === "1h" ? [] : (subset.hours || []),
+          totals: subset.totals || {},
+          bands: data.bands,
+          matchWindowMin: data.matchWindowMin,
+          windowStartUtc: data.windowStartUtc || null,
+          windowEndUtc: data.windowEndUtc || null,
+          dateStrUY: data.dateStrUY || null,
+          sparseBucketThreshold: data.sparseBucketThreshold || 50,
+          updatedAt: data.updatedAt ? data.updatedAt.toMillis() : null,
+        };
+        const entry = statsPunctualityCache.set(cacheKey, payload);
+        return sendCachedWrapped(req, res, entry, { source: "firestore" });
+      }
+
+      // ── Rama 7d: merge de 7 docs daily ──
       const dates = (() => {
         if (/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) return [dateParam];
         // Construir las fechas UY: ayer, antier, etc.
         const now = new Date();
         const uy = new Date(now.toLocaleString("en-US", { timeZone: "America/Montevideo" }));
-        const N = range === "7d" ? 7 : 1;
+        const N = 7;
         const out = [];
         for (let i = 1; i <= N; i++) {
           const d = new Date(uy);
@@ -2059,19 +2313,6 @@ exports.api = onRequest({
         }, { source: "firestore" });
       }
 
-      // Extrae el subset (hours + totals) que corresponde al filtro
-      // company de un solo doc. Si el doc viejo no tiene byCompany y
-      // pidieron una empresa específica, devolvemos null para indicar
-      // que ese día no se puede desagregar.
-      const subsetForCompany = (data, companyKey) => {
-        if (companyKey === "Todas") {
-          return { hours: data.hours || [], totals: data.totals || {} };
-        }
-        const bc = data.byCompany && data.byCompany[companyKey];
-        if (!bc) return null; // doc legacy sin breakdown
-        return { hours: bc.hours || [], totals: bc.totals || {} };
-      };
-
       const subsets = validDocs
         .map(d => subsetForCompany(d.data, company))
         .filter(Boolean);
@@ -2089,26 +2330,35 @@ exports.api = onRequest({
       // Merge: sumar counts por bucket y recalcular pcts.
       const sparseThreshold = validDocs[0].data.sparseBucketThreshold || 50;
       const mergedHours = Array.from({ length: 24 }, (_, h) => ({
-        h, early: 0, onTime: 0, late: 0, unmatched: 0, total: 0,
+        h,
+        green: 0, yellowEarly: 0, yellowLate: 0, redEarly: 0, redLate: 0,
+        unmatched: 0, total: 0,
       }));
-      const mergedTotals = { matched: 0, unmatched: 0, early: 0, onTime: 0, late: 0 };
+      const mergedTotals = {
+        matched: 0, unmatched: 0,
+        green: 0, yellowEarly: 0, yellowLate: 0, redEarly: 0, redLate: 0,
+      };
       for (const s of subsets) {
         const hours = Array.isArray(s.hours) ? s.hours : [];
         for (const b of hours) {
           const h = Number(b.h);
           if (!Number.isFinite(h) || h < 0 || h > 23) continue;
-          mergedHours[h].early    += b.early || 0;
-          mergedHours[h].onTime   += b.onTime || 0;
-          mergedHours[h].late     += b.late || 0;
-          mergedHours[h].unmatched += b.unmatched || 0;
-          mergedHours[h].total    += b.total || 0;
+          mergedHours[h].green       += b.green       || 0;
+          mergedHours[h].yellowEarly += b.yellowEarly || 0;
+          mergedHours[h].yellowLate  += b.yellowLate  || 0;
+          mergedHours[h].redEarly    += b.redEarly    || 0;
+          mergedHours[h].redLate     += b.redLate     || 0;
+          mergedHours[h].unmatched   += b.unmatched   || 0;
+          mergedHours[h].total       += b.total       || 0;
         }
         const t = s.totals || {};
-        mergedTotals.matched   += t.matched || 0;
-        mergedTotals.unmatched += t.unmatched || 0;
-        mergedTotals.early     += t.early || 0;
-        mergedTotals.onTime    += t.onTime || 0;
-        mergedTotals.late      += t.late || 0;
+        mergedTotals.matched     += t.matched     || 0;
+        mergedTotals.unmatched   += t.unmatched   || 0;
+        mergedTotals.green       += t.green       || 0;
+        mergedTotals.yellowEarly += t.yellowEarly || 0;
+        mergedTotals.yellowLate  += t.yellowLate  || 0;
+        mergedTotals.redEarly    += t.redEarly    || 0;
+        mergedTotals.redLate     += t.redLate     || 0;
       }
       // En 7d el threshold sparse escala con los días disponibles —
       // SPARSE × N días. Así una hora con 5 muestras × 7 días = 35
@@ -2116,20 +2366,55 @@ exports.api = onRequest({
       const effectiveSparse = sparseThreshold * subsets.length;
       for (const b of mergedHours) {
         if (b.total >= effectiveSparse) {
-          b.earlyPct  = b.early / b.total;
-          b.onTimePct = b.onTime / b.total;
-          b.latePct   = b.late / b.total;
+          b.greenPct       = b.green       / b.total;
+          b.yellowEarlyPct = b.yellowEarly / b.total;
+          b.yellowLatePct  = b.yellowLate  / b.total;
+          b.redEarlyPct    = b.redEarly    / b.total;
+          b.redLatePct     = b.redLate     / b.total;
           b.sparse = false;
         } else {
-          b.earlyPct = null;
-          b.onTimePct = null;
-          b.latePct = null;
+          b.greenPct       = null;
+          b.yellowEarlyPct = null;
+          b.yellowLatePct  = null;
+          b.redEarlyPct    = null;
+          b.redLatePct     = null;
           b.sparse = true;
         }
       }
-      mergedTotals.onTimePct = mergedTotals.matched > 0
-        ? mergedTotals.onTime / mergedTotals.matched
+      // OTP = green / matched. Convención industrial: unmatched no entra
+      // al denominador (no tiene Δt computable).
+      mergedTotals.greenPct = mergedTotals.matched > 0
+        ? mergedTotals.green / mergedTotals.matched
         : null;
+
+      // byDay[7]: una entrada por día con totals + dateStr. Permite al
+      // cliente renderear chart de 7 columnas (1 por día) en vez de
+      // mergear en hours[24]. Ordenamos cronológicamente (más viejo
+      // primero) para que el chart se lea izquierda→derecha como timeline.
+      const byDay = validDocs
+        .map(d => {
+          const s = subsetForCompany(d.data, company);
+          if (!s) return null;
+          const t = s.totals || {};
+          const matched = t.matched || 0;
+          return {
+            date: d.date,
+            matched,
+            unmatched:   t.unmatched   || 0,
+            green:       t.green       || 0,
+            yellowEarly: t.yellowEarly || 0,
+            yellowLate:  t.yellowLate  || 0,
+            redEarly:    t.redEarly    || 0,
+            redLate:     t.redLate     || 0,
+            greenPct: matched > 0 ? (t.green || 0) / matched : null,
+            // Sparse a nivel día con threshold 1000× del horario sparse
+            // (50 × 24h aprox) para que un día con muy poca data no
+            // se muestre con % engañoso.
+            sparse: matched < 1000,
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.date.localeCompare(b.date));
 
       const payload = {
         available: true,
@@ -2139,8 +2424,9 @@ exports.api = onRequest({
         requestedDates: dates,
         usedDates: validDocs.map(d => d.date),
         hours: mergedHours,
+        byDay,
         totals: mergedTotals,
-        onTimeThresholdMin: validDocs[0].data.onTimeThresholdMin,
+        bands: validDocs[0].data.bands,
         matchWindowMin: validDocs[0].data.matchWindowMin,
         sparseBucketThreshold: sparseThreshold,
         effectiveSparseBucketThreshold: effectiveSparse,
@@ -2206,14 +2492,16 @@ exports.api = onRequest({
       const lines = Object.entries(byLine)
         .map(([line, b]) => ({
           line,
-          matched: b.matched || 0,
-          onTime: b.onTime || 0,
-          early: b.early || 0,
-          late: b.late || 0,
-          onTimePct: b.onTimePct,
+          matched:     b.matched     || 0,
+          green:       b.green       || 0,
+          yellowEarly: b.yellowEarly || 0,
+          yellowLate:  b.yellowLate  || 0,
+          redEarly:    b.redEarly    || 0,
+          redLate:     b.redLate     || 0,
+          greenPct:    b.greenPct,
         }))
-        .filter(l => l.matched >= minSamples && l.onTimePct != null)
-        .sort((a, b) => b.onTimePct - a.onTimePct)
+        .filter(l => l.matched >= minSamples && l.greenPct != null)
+        .sort((a, b) => b.greenPct - a.greenPct)
         .slice(0, limit);
 
       const payload = {
@@ -2282,6 +2570,92 @@ exports.api = onRequest({
     } catch (e) {
       logger.error(`/stats/top-stops error: ${e.message}`);
       return fail(res, "STATS_UNAVAILABLE", "No se pudo cargar ranking de paradas");
+    }
+  }
+
+  // ── GET /busstops/:id/summary ── (Unif 21)
+  // KPIs combinados para la página `chevamo.com.uy/mvd/paradas`:
+  //   - info parada (street1/street2, coords)
+  //   - líneas que paran ahí (del GTFS stopLines)
+  //   - stats de últimas 24h: arrivals count + OTP + breakdown bandas
+  //     (del doc `punctuality_by_stop/latest` map agregado)
+  //
+  // NO incluye próximos arribos (se piden por separado /upcoming) ni
+  // horarios planeados (/schedules). Eso es responsabilidad del cliente
+  // hacer las 4 calls en paralelo.
+  const summaryMatch = url.match(/^\/busstops\/(\d+)\/summary$/);
+  if (summaryMatch && req.method === "GET") {
+    const id = summaryMatch[1];
+    try {
+      const db = admin.firestore();
+      const cacheKey = `summary:${id}`;
+      const cached = statsPunctualityCache.get(cacheKey);
+      if (cached) return sendCachedWrapped(req, res, cached, { source: "firestore" });
+
+      // 1. Info parada — del catalog GTFS (lazy-load + cache in-memory).
+      // `ensureLoaded()` devuelve `{ stopsById, stopsByLine }` (Maps).
+      await stopsCatalog.ensureLoaded(getToken);
+      const stop = stopsCatalog.getStopById(id);
+      if (!stop) {
+        return ok(res, {
+          available: false,
+          stopId: id,
+          reason: "stop-not-found",
+        }, { source: "firestore" });
+      }
+
+      // 2. Líneas que paran ahí (GTFS).
+      const lines = stopLines[id] || [];
+
+      // 3. Stats de últimas 24h del doc agregado (byStop serializado a JSON
+      // string para evitar el límite Firestore de 40k index entries).
+      const snap = await db.collection("punctuality_by_stop").doc("latest").get();
+      const data = snap.exists ? snap.data() : null;
+      let stopStats = null;
+      if (data && data.byStopJson) {
+        try {
+          const byStop = JSON.parse(data.byStopJson);
+          stopStats = byStop[id] || null;
+        } catch (e) {
+          logger.warn(`/busstops/${id}/summary: byStopJson parse failed: ${e.message}`);
+        }
+      }
+
+      const payload = {
+        available: true,
+        stopId: id,
+        stop: {
+          name: stop.name || null,
+          // stop del catalog tiene { stopId, name, lat, lng } — los streets
+          // no están porque getStopById los descarta. Si los queremos hay
+          // que ampliar el catalog. Por ahora null.
+          street1: null,
+          street2: null,
+          location: { lat: stop.lat, lng: stop.lng },
+        },
+        lines,
+        // Stats — null si la parada no tuvo suficiente actividad en 24h.
+        stats: stopStats ? {
+          arrivals24h:  stopStats.total      || 0,
+          matched24h:   stopStats.matched    || 0,
+          linesCount:   stopStats.linesCount || 0,
+          greenPct:     stopStats.greenPct,
+          green:        stopStats.green       || 0,
+          yellowEarly:  stopStats.yellowEarly || 0,
+          yellowLate:   stopStats.yellowLate  || 0,
+          redEarly:     stopStats.redEarly    || 0,
+          redLate:      stopStats.redLate     || 0,
+          sparse:       stopStats.sparse !== false,
+        } : null,
+        bands: data ? data.bands : null,
+        windowHours: data ? data.windowHours : 24,
+        updatedAt: data && data.updatedAt ? data.updatedAt.toMillis() : null,
+      };
+      const entry = statsPunctualityCache.set(cacheKey, payload);
+      return sendCachedWrapped(req, res, entry, { source: "firestore" });
+    } catch (e) {
+      logger.error(`/busstops/${id}/summary error: ${e.message}`);
+      return fail(res, "SUMMARY_UNAVAILABLE", "No se pudo cargar resumen de la parada");
     }
   }
 
@@ -5297,6 +5671,60 @@ exports.aggregatePunctualityHourly = onSchedule(
   },
   async () => {
     await punctualityAggregator.runAndPersistHourly({
+      admin,
+      getStopSchedules,
+    });
+  }
+);
+
+// Rolling 24h desde la última hora cerrada. Ventana fija que cambia al
+// cruzar cada hora UY. Escribe `punctuality_rolling_24h/latest` con la
+// misma estructura agregada que el daily (hours + totals + byCompany +
+// byLine). Alimenta la pastilla "24h" de la gráfica DATA — distinto al
+// daily que es "día calendario UY anterior".
+exports.aggregatePunctualityRolling24h = onSchedule(
+  {
+    schedule: "0 * * * *",  // al minuto 0 de cada hora UTC
+    timeZone: "Etc/UTC",
+    memory: "1GiB",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    await punctualityAggregator.runAndPersistRolling24h({
+      admin,
+      getStopSchedules,
+    });
+  }
+);
+
+// Hoy parcial — día calendario UY hasta la última hora cerrada. Escribe
+// `punctuality_today/latest` con hours[24] (las horas futuras quedan
+// `total: 0` → sparse en el chart). Alimenta la pastilla "HOY".
+exports.aggregatePunctualityToday = onSchedule(
+  {
+    schedule: "every 10 minutes",
+    memory: "1GiB",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    await punctualityAggregator.runAndPersistToday({
+      admin,
+      getStopSchedules,
+    });
+  }
+);
+
+// Por parada (rolling 24h). Escribe 1 doc `punctuality_by_stop/latest`
+// con map { stopId: stats }. Alimenta el endpoint /busstops/:id/summary
+// para la página `chevamo.com.uy/mvd/paradas`.
+exports.aggregatePunctualityByStop = onSchedule(
+  {
+    schedule: "every 10 minutes",
+    memory: "1GiB",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    await punctualityAggregator.runAndPersistByStop({
       admin,
       getStopSchedules,
     });

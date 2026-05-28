@@ -122,6 +122,78 @@ async function createPayment(client, input) {
 }
 
 /**
+ * Crear una Preference de Checkout Pro (link de pago dinámico). Útil para
+ * Agenda CheVamo: cliente reserva → backend genera preference → cliente va
+ * a MP checkout → paga → MP redirect a back_urls + envía webhook.
+ *
+ * Doc: https://www.mercadopago.com.uy/developers/es/reference/preferences/_checkout_preferences/post
+ *
+ * @param {CountryClient} client
+ * @param {Object} input
+ * @param {Array<{title:string, quantity:number, unit_price:number}>} input.items
+ * @param {string} input.payerEmail
+ * @param {{success:string, failure:string, pending:string}} input.backUrls
+ * @param {string} input.externalReference - id interno (ej "agenda:peluqueria-italiana:<uuid>")
+ * @param {string} [input.notificationUrl] - webhook MP
+ * @param {Object} [input.metadata] - data extra que vuelve en el webhook
+ * @returns {Promise<Object>} preference con { id, init_point, sandbox_init_point, ... }
+ */
+async function createPreference(client, input) {
+  if (client.mock) {
+    return {
+      id: `mock_pref_${Date.now()}`,
+      init_point: `https://example.com/mock-checkout?ref=${encodeURIComponent(input.externalReference || "")}`,
+      sandbox_init_point: `https://example.com/mock-checkout-sandbox?ref=${encodeURIComponent(input.externalReference || "")}`,
+      _mock: true,
+    };
+  }
+
+  const url = `${MP_API}/checkout/preferences`;
+  const currency = currencyForCountry(client.country);
+  const body = {
+    items: input.items.map((it) => ({
+      title:       it.title,
+      quantity:    it.quantity || 1,
+      unit_price:  it.unit_price,
+      currency_id: currency,
+    })),
+    payer: input.payerEmail ? { email: input.payerEmail } : undefined,
+    back_urls:           input.backUrls,
+    auto_return:         "approved",
+    external_reference:  input.externalReference || undefined,
+    notification_url:    input.notificationUrl || undefined,
+    metadata:            input.metadata || undefined,
+    statement_descriptor: "CHEVAMO",
+  };
+
+  const r = await axios.post(url, body, {
+    headers: {
+      "Authorization":  `Bearer ${client.accessToken}`,
+      "Content-Type":   "application/json",
+    },
+    timeout: 15_000,
+  });
+  return r.data;
+}
+
+/**
+ * Recupera un payment por ID — usado en el webhook handler para confirmar
+ * el estado real del pago (el webhook trae solo el ID, hay que pull el
+ * detalle).
+ */
+async function getPayment(client, paymentId) {
+  if (client.mock) {
+    return { id: paymentId, status: "approved", _mock: true };
+  }
+  const url = `${MP_API}/v1/payments/${paymentId}`;
+  const r = await axios.get(url, {
+    headers: { "Authorization": `Bearer ${client.accessToken}` },
+    timeout: 10_000,
+  });
+  return r.data;
+}
+
+/**
  * Crear customer en MP (lo usamos para asociar tarjetas guardadas al user).
  * Doc: https://www.mercadopago.com.uy/developers/es/reference/customers/_customers/post
  *
@@ -253,6 +325,8 @@ function currencyForCountry(country) {
 module.exports = {
   getClient,
   createPayment,
+  createPreference,
+  getPayment,
   createCustomer,
   saveCardToCustomer,
   listCustomerCards,

@@ -121,6 +121,25 @@ async function getActiveClustersByLine(line, admin) {
 }
 
 /**
+ * Devuelve TODOS los clusters comunitarios activos agrupados por línea.
+ * Versión global de `getActiveClustersByLine` — itera todo el cache y
+ * clusteriza cada línea por separado. Útil para `/buses` global (Función 2
+ * de la visión Comunidad) donde necesitamos fusionar IMM + Comunidad sin
+ * scope de parada.
+ *
+ * Líneas sin clusters (solo reports stale o sin agrupar) no entran al map.
+ */
+async function getAllActiveClustersMap(admin) {
+  const map = await ensureFresh(admin);
+  const out = new Map();
+  for (const [line, reports] of map.entries()) {
+    const clusters = clusterer.cluster(reports);
+    if (clusters.length > 0) out.set(line, clusters);
+  }
+  return out;
+}
+
+/**
  * Stats para `/admin/diagnostics`.
  */
 function stats() {
@@ -150,6 +169,7 @@ module.exports = {
   ensureFresh,
   getActiveByLine,
   getActiveClustersByLine,
+  getAllActiveClustersMap,
   stats,
   _resetCache,
 };

@@ -1,13 +1,23 @@
 /**
- * Aggregator diario de puntualidad de buses Mvd.
+ * Aggregator de puntualidad de buses Mvd.
  *
  * Cruza `bus_arrivals` (BigQuery, eventos detectados por proximidad) con
  * el catálogo estático `stop-schedules.json` (horarios GTFS programados
- * por parada × línea × calendario) y clasifica cada arribo en:
+ * por parada × línea × calendario) y clasifica cada arribo según el
+ * delta Δt = (real - scheduled) en segundos:
  *
- *   - early   (delta < -5 min, llegó antes de lo programado)
- *   - onTime  (|delta| ≤ 5 min, puntual)
- *   - late    (delta > +5 min, llegó tarde)
+ *   - green       (-60  ≤ Δt ≤ +180)   en hora
+ *   - yellowEarly (-600 ≤ Δt < -60)    impuntual leve adelantado
+ *   - yellowLate  (+181 ≤ Δt ≤ +600)   impuntual leve atrasado
+ *   - redEarly    (Δt ≤ -601)          impuntual grave adelantado
+ *   - redLate     (Δt ≥ +601)          impuntual grave atrasado
+ *
+ * OTP = green / matched × 100 (estándar industrial, unmatched no entra).
+ *
+ * Filosofía: ventana verde asimétrica (60s early vs 180s late) —
+ * anticiparse es peor que llegar tarde para el user (pierde el bus).
+ * Bandas amarilla y roja simétricas. El cliente DATA agrupa los 4
+ * yellow+red en colores únicos; futuros widgets discriminan early/late.
  *
  * Agrega por hora del día (0-23h UY) y escribe a Firestore
  * `punctuality_daily/{YYYY-MM-DD}` con 24 buckets. El endpoint
@@ -33,7 +43,22 @@ const BQ_PROJECT = process.env.GCLOUD_PROJECT || "vamo-dbad6";
 const BQ_DATASET = process.env.BQ_TELEMETRY_DATASET || "vamo_telemetry";
 const BQ_LOCATION = process.env.BQ_TELEMETRY_LOCATION || "southamerica-east1";
 
-const ON_TIME_THRESHOLD_MIN = 5;     // ±5 min = puntual
+// Bandas de clasificación en segundos. Asimétrico en verde (favorece late
+// porque anticiparse hace perder el bus). Simétrico en amarillo y rojo.
+const BAND_GREEN_LO_SEC  = -60;   // verde: -60 ≤ Δt
+const BAND_GREEN_HI_SEC  = 180;   // verde: Δt ≤ +180
+const BAND_YELLOW_LO_SEC = -600;  // amarillo early: -600 ≤ Δt < -60
+const BAND_YELLOW_HI_SEC = 600;   // amarillo late:  +181 ≤ Δt ≤ +600
+const BAND_RED_ABS_SEC   = 601;   // rojo: |Δt| ≥ 601
+
+const BANDS = Object.freeze({
+  green:  { loSec: BAND_GREEN_LO_SEC,  hiSec: BAND_GREEN_HI_SEC },
+  yellow: { loSec: BAND_YELLOW_LO_SEC, hiSec: BAND_YELLOW_HI_SEC },
+  red:    { thresholdSec: BAND_RED_ABS_SEC },
+});
+
+const CATEGORIES = ["green", "yellowEarly", "yellowLate", "redEarly", "redLate"];
+
 const MATCH_WINDOW_MIN = 30;          // ventana búsqueda en schedule
 const SPARSE_BUCKET_THRESHOLD = 50;   // <50 muestras → bucket sparse
 
@@ -59,8 +84,16 @@ function getBqClient() {
  *   - uyMinuteOfDay (0-1439) — para match contra schedule
  *   - uyDow (0=Sun, 1=Mon, ..., 6=Sat) — para elegir WD/Sat/Sun
  */
-function buildQuery() {
+/**
+ * @param {string} [dateStr] - YYYY-MM-DD UY. Si no se pasa, query ayer
+ *   relativo a CURRENT_DATE UY (comportamiento default del cron diario).
+ *   Pasarlo permite re-generar docs daily de cualquier día pasado.
+ */
+function buildQuery(dateStr) {
   const ds = `\`${BQ_PROJECT}.${BQ_DATASET}\``;
+  const dateFilter = dateStr
+    ? `DATE('${dateStr}')`
+    : `DATE_SUB(CURRENT_DATE('America/Montevideo'), INTERVAL 1 DAY)`;
   return `
 SELECT
   ts,
@@ -72,7 +105,7 @@ SELECT
     + EXTRACT(MINUTE FROM ts AT TIME ZONE 'America/Montevideo') AS uyMinuteOfDay,
   EXTRACT(DAYOFWEEK FROM ts AT TIME ZONE 'America/Montevideo') - 1 AS uyDow
 FROM ${ds}.bus_arrivals
-WHERE DATE(ts, 'America/Montevideo') = DATE_SUB(CURRENT_DATE('America/Montevideo'), INTERVAL 1 DAY)
+WHERE DATE(ts, 'America/Montevideo') = ${dateFilter}
   AND eventType = 'arrived'
   AND line IS NOT NULL AND line != ''
   AND stopId IS NOT NULL AND stopId != ''
@@ -80,10 +113,10 @@ LIMIT 2000000
 `.trim();
 }
 
-async function runQuery() {
+async function runQuery(dateStr) {
   const bq = getBqClient();
   const [job] = await bq.createQueryJob({
-    query: buildQuery(),
+    query: buildQuery(dateStr),
     location: BQ_LOCATION,
     useLegacySql: false,
   });
@@ -179,10 +212,22 @@ function findClosestSchedule(realMin, scheduledArr) {
   return bestDelta;
 }
 
+/**
+ * Clasifica un delta (en minutos) en una de las 5 bandas según los
+ * thresholds en segundos. Boundaries:
+ *   redEarly    Δt ≤ -601s
+ *   yellowEarly -600s ≤ Δt < -60s     (strict <, no incluye -60)
+ *   green       -60s ≤ Δt ≤ +180s
+ *   yellowLate  +181s ≤ Δt ≤ +600s    (strict >, no incluye +180)
+ *   redLate     Δt ≥ +601s
+ */
 function classify(deltaMin) {
-  if (deltaMin < -ON_TIME_THRESHOLD_MIN) return "early";
-  if (deltaMin > ON_TIME_THRESHOLD_MIN) return "late";
-  return "onTime";
+  const deltaSec = deltaMin * 60;
+  if (deltaSec <= -BAND_RED_ABS_SEC)  return "redEarly";
+  if (deltaSec >=  BAND_RED_ABS_SEC)  return "redLate";
+  if (deltaSec <   BAND_GREEN_LO_SEC) return "yellowEarly";
+  if (deltaSec >   BAND_GREEN_HI_SEC) return "yellowLate";
+  return "green";
 }
 
 // Empresas Mvd canónicas. Buckets para desagregación. Cualquier valor
@@ -216,36 +261,62 @@ function normalizeCompany(raw) {
 function buildEmptyHours() {
   return Array.from({ length: 24 }, (_, h) => ({
     h,
-    early: 0,
-    onTime: 0,
-    late: 0,
+    green: 0,
+    yellowEarly: 0,
+    yellowLate: 0,
+    redEarly: 0,
+    redLate: 0,
     unmatched: 0,
     total: 0,
   }));
 }
 
+/**
+ * Computa pcts por bucket. `greenPct` es el OTP del bucket (estándar
+ * industrial). Los pcts amarillos y rojos son útiles para gráficas que
+ * discriminan tipos de impuntualidad.
+ *
+ * Sparse: si `total` < SPARSE_BUCKET_THRESHOLD, todos los pcts son null
+ * para evitar mostrar % engañosos con baja muestra.
+ */
 function finalizeHours(hours) {
   for (const b of hours) {
     if (b.total >= SPARSE_BUCKET_THRESHOLD) {
-      b.earlyPct = b.early / b.total;
-      b.onTimePct = b.onTime / b.total;
-      b.latePct = b.late / b.total;
+      b.greenPct       = b.green       / b.total;
+      b.yellowEarlyPct = b.yellowEarly / b.total;
+      b.yellowLatePct  = b.yellowLate  / b.total;
+      b.redEarlyPct    = b.redEarly    / b.total;
+      b.redLatePct     = b.redLate     / b.total;
       b.sparse = false;
     } else {
-      b.earlyPct = null;
-      b.onTimePct = null;
-      b.latePct = null;
+      b.greenPct       = null;
+      b.yellowEarlyPct = null;
+      b.yellowLatePct  = null;
+      b.redEarlyPct    = null;
+      b.redLatePct     = null;
       b.sparse = true;
     }
   }
 }
 
 function buildEmptyTotals() {
-  return { matched: 0, unmatched: 0, early: 0, onTime: 0, late: 0 };
+  return {
+    matched: 0,
+    unmatched: 0,
+    green: 0,
+    yellowEarly: 0,
+    yellowLate: 0,
+    redEarly: 0,
+    redLate: 0,
+  };
 }
 
+/**
+ * `greenPct` es el OTP: green / matched. Convención industrial — unmatched
+ * NO entra al denominador (no tiene Δt computable, va a otra métrica).
+ */
 function finalizeTotals(t) {
-  t.onTimePct = t.matched > 0 ? t.onTime / t.matched : null;
+  t.greenPct = t.matched > 0 ? t.green / t.matched : null;
   return t;
 }
 
@@ -354,17 +425,25 @@ function yesterdayDateStrUY() {
  * Inyectamos `admin` y `getStopSchedules` para testeabilidad y para
  * no acoplar este módulo al boot de index.js.
  */
-async function runAndPersist({ admin, getStopSchedules } = {}) {
+/**
+ * @param {object} opts
+ * @param {object} opts.admin - Firebase admin SDK
+ * @param {function} opts.getStopSchedules
+ * @param {string} [opts.dateStrOverride] - YYYY-MM-DD UY para regenerar
+ *   un día pasado. Si no se pasa, calcula ayer (comportamiento default
+ *   del cron diario). Útil para reproc histórico desde script ad-hoc.
+ */
+async function runAndPersist({ admin, getStopSchedules, dateStrOverride } = {}) {
   if (!admin) throw new Error("admin SDK requerido");
   if (typeof getStopSchedules !== "function") {
     throw new Error("getStopSchedules requerido");
   }
   const startMs = Date.now();
-  const dateStr = yesterdayDateStrUY();
+  const dateStr = dateStrOverride || yesterdayDateStrUY();
 
   let rows;
   try {
-    rows = await runQuery();
+    rows = await runQuery(dateStrOverride);
   } catch (e) {
     logger.error(`aggregatePunctuality: BQ query failed: ${e.message}`);
     return { ok: false, error: e.message };
@@ -390,7 +469,7 @@ async function runAndPersist({ admin, getStopSchedules } = {}) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       rowsTotal: rows.length,
       indexedStops,
-      onTimeThresholdMin: ON_TIME_THRESHOLD_MIN,
+      bands: BANDS,
       matchWindowMin: MATCH_WINDOW_MIN,
       sparseBucketThreshold: SPARSE_BUCKET_THRESHOLD,
       computedInMs,
@@ -398,8 +477,8 @@ async function runAndPersist({ admin, getStopSchedules } = {}) {
 
   logger.info(
     `aggregatePunctuality ${dateStr}: ${rows.length} arribos, matched=${result.totals.matched}, ` +
-    `puntual=${result.totals.onTime}/${result.totals.matched} ` +
-    `(${result.totals.onTimePct !== null ? (result.totals.onTimePct * 100).toFixed(1) : "—"}%) ` +
+    `OTP green=${result.totals.green}/${result.totals.matched} ` +
+    `(${result.totals.greenPct !== null ? (result.totals.greenPct * 100).toFixed(1) : "—"}%) ` +
     `en ${computedInMs}ms`
   );
   return {
@@ -407,7 +486,7 @@ async function runAndPersist({ admin, getStopSchedules } = {}) {
     dateStr,
     rows: rows.length,
     matched: result.totals.matched,
-    onTimePct: result.totals.onTimePct,
+    greenPct: result.totals.greenPct,
     computedInMs,
   };
 }
@@ -526,7 +605,7 @@ async function runAndPersistHourly({ admin, getStopSchedules } = {}) {
       ...result,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       rowsTotal: rows.length,
-      onTimeThresholdMin: ON_TIME_THRESHOLD_MIN,
+      bands: BANDS,
       matchWindowMin: MATCH_WINDOW_MIN,
       windowMinutes: 60,
       computedInMs,
@@ -534,26 +613,442 @@ async function runAndPersistHourly({ admin, getStopSchedules } = {}) {
 
   logger.info(
     `aggregatePunctualityHourly: ${rows.length} arribos última hora, matched=${result.totals.matched}, ` +
-    `puntual=${result.totals.onTime}/${result.totals.matched} ` +
-    `(${result.totals.onTimePct !== null ? (result.totals.onTimePct * 100).toFixed(1) : "—"}%) ` +
+    `OTP green=${result.totals.green}/${result.totals.matched} ` +
+    `(${result.totals.greenPct !== null ? (result.totals.greenPct * 100).toFixed(1) : "—"}%) ` +
     `en ${computedInMs}ms`
   );
   return {
     ok: true,
     rows: rows.length,
     matched: result.totals.matched,
-    onTimePct: result.totals.onTimePct,
+    greenPct: result.totals.greenPct,
     computedInMs,
   };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Variante ROLLING 24h — desde la última hora cerrada hacia atrás
+// ─────────────────────────────────────────────────────────────────
+//
+// Spec user (Unif 21): "últimas 24h a partir de la última hora cerrada".
+// Ej: ahora 16:13 UY → última hora cerrada 16:00 → ventana
+// [2026-05-25 16:00, 2026-05-26 16:00). Misma estructura agregada que el
+// cron daily (hours + totals + byCompany + byLine) pero rolling.
+//
+// Cadencia: cada hora UY al cruzar minuto 0. Entre runs el doc no cambia
+// (la ventana es la misma hasta que cambia la hora).
+
+function buildRolling24hQuery() {
+  const ds = `\`${BQ_PROJECT}.${BQ_DATASET}\``;
+  return `
+SELECT
+  ts,
+  line,
+  stopId,
+  company,
+  EXTRACT(HOUR FROM ts AT TIME ZONE 'America/Montevideo') AS uyHour,
+  EXTRACT(HOUR FROM ts AT TIME ZONE 'America/Montevideo') * 60
+    + EXTRACT(MINUTE FROM ts AT TIME ZONE 'America/Montevideo') AS uyMinuteOfDay,
+  EXTRACT(DAYOFWEEK FROM ts AT TIME ZONE 'America/Montevideo') - 1 AS uyDow
+FROM ${ds}.bus_arrivals
+WHERE ts >= TIMESTAMP_SUB(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR), INTERVAL 24 HOUR)
+  AND ts <  TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR)
+  AND eventType = 'arrived'
+  AND line IS NOT NULL AND line != ''
+  AND stopId IS NOT NULL AND stopId != ''
+LIMIT 2000000
+`.trim();
+}
+
+async function runRolling24hQuery() {
+  const bq = getBqClient();
+  const [job] = await bq.createQueryJob({
+    query: buildRolling24hQuery(),
+    location: BQ_LOCATION,
+    useLegacySql: false,
+  });
+  const [rows] = await job.getQueryResults();
+  return rows;
+}
+
+/**
+ * Mismo aggregate() que el daily (con hours + byCompany + byLine), pero
+ * sobre la ventana rolling 24h. Devuelve además el rango temporal exacto
+ * que se procesó para que el frontend pueda mostrarlo.
+ */
+async function runAndPersistRolling24h({ admin, getStopSchedules } = {}) {
+  if (!admin) throw new Error("admin SDK requerido");
+  if (typeof getStopSchedules !== "function") {
+    throw new Error("getStopSchedules requerido");
+  }
+  const startMs = Date.now();
+  let rows;
+  try {
+    rows = await runRolling24hQuery();
+  } catch (e) {
+    logger.error(`aggregatePunctualityRolling24h: BQ query failed: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+  if (!rows || rows.length === 0) {
+    logger.info(`aggregatePunctualityRolling24h: 0 rows — skip write`);
+    return { ok: true, rows: 0, skipped: "no rows" };
+  }
+
+  const rawSchedules = await getStopSchedules();
+  const indexed = indexSchedules(rawSchedules);
+  const indexedStops = Object.keys(indexed).length;
+
+  // dateStr puramente informativo — el doc es rolling, no asociado a 1 día.
+  const result = aggregate(rows, indexed, "rolling-24h");
+  const computedInMs = Date.now() - startMs;
+
+  // Ventana exacta procesada (UTC). El cliente puede mostrarla como rango.
+  const windowEnd = new Date();
+  windowEnd.setUTCMinutes(0, 0, 0); // truncar al inicio de la hora actual UTC
+  const windowStart = new Date(windowEnd.getTime() - 24 * 60 * 60 * 1000);
+
+  await admin
+    .firestore()
+    .collection("punctuality_rolling_24h")
+    .doc("latest")
+    .set({
+      ...result,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      rowsTotal: rows.length,
+      indexedStops,
+      bands: BANDS,
+      matchWindowMin: MATCH_WINDOW_MIN,
+      sparseBucketThreshold: SPARSE_BUCKET_THRESHOLD,
+      windowStartUtc: windowStart.toISOString(),
+      windowEndUtc: windowEnd.toISOString(),
+      windowHours: 24,
+      computedInMs,
+    });
+
+  logger.info(
+    `aggregatePunctualityRolling24h: ${rows.length} arribos en [${windowStart.toISOString()}, ${windowEnd.toISOString()}), ` +
+    `matched=${result.totals.matched}, OTP green=${result.totals.green}/${result.totals.matched} ` +
+    `(${result.totals.greenPct !== null ? (result.totals.greenPct * 100).toFixed(1) : "—"}%) ` +
+    `en ${computedInMs}ms`
+  );
+  return {
+    ok: true,
+    rows: rows.length,
+    matched: result.totals.matched,
+    greenPct: result.totals.greenPct,
+    windowStartUtc: windowStart.toISOString(),
+    windowEndUtc: windowEnd.toISOString(),
+    computedInMs,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Variante TODAY — hoy parcial hasta la última hora cerrada UY
+// ─────────────────────────────────────────────────────────────────
+//
+// Spec user Unif 21: "HOY tiene 24 columnas que se completan a medida
+// que cierra la hora". Mismo aggregate() que el daily (hours[24] +
+// totals + byCompany + byLine) pero filtrado al día calendario UY
+// corriente, hasta la última hora cerrada (no incluye la hora en curso).
+//
+// Cadencia: cron cada 10 min para freshness. El bucket de la hora en
+// curso permanece vacío hasta que cierre (al hacer hour-cross).
+
+function buildTodayQuery() {
+  const ds = `\`${BQ_PROJECT}.${BQ_DATASET}\``;
+  return `
+SELECT
+  ts,
+  line,
+  stopId,
+  company,
+  EXTRACT(HOUR FROM ts AT TIME ZONE 'America/Montevideo') AS uyHour,
+  EXTRACT(HOUR FROM ts AT TIME ZONE 'America/Montevideo') * 60
+    + EXTRACT(MINUTE FROM ts AT TIME ZONE 'America/Montevideo') AS uyMinuteOfDay,
+  EXTRACT(DAYOFWEEK FROM ts AT TIME ZONE 'America/Montevideo') - 1 AS uyDow
+FROM ${ds}.bus_arrivals
+WHERE DATE(ts, 'America/Montevideo') = CURRENT_DATE('America/Montevideo')
+  AND ts < TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR)
+  AND eventType = 'arrived'
+  AND line IS NOT NULL AND line != ''
+  AND stopId IS NOT NULL AND stopId != ''
+LIMIT 2000000
+`.trim();
+}
+
+async function runTodayQuery() {
+  const bq = getBqClient();
+  const [job] = await bq.createQueryJob({
+    query: buildTodayQuery(),
+    location: BQ_LOCATION,
+    useLegacySql: false,
+  });
+  const [rows] = await job.getQueryResults();
+  return rows;
+}
+
+function todayDateStrUY() {
+  const now = new Date();
+  const uy = new Date(now.toLocaleString("en-US", { timeZone: "America/Montevideo" }));
+  const y = uy.getFullYear();
+  const m = String(uy.getMonth() + 1).padStart(2, "0");
+  const d = String(uy.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+async function runAndPersistToday({ admin, getStopSchedules } = {}) {
+  if (!admin) throw new Error("admin SDK requerido");
+  if (typeof getStopSchedules !== "function") {
+    throw new Error("getStopSchedules requerido");
+  }
+  const startMs = Date.now();
+  const dateStr = todayDateStrUY();
+
+  let rows;
+  try {
+    rows = await runTodayQuery();
+  } catch (e) {
+    logger.error(`aggregatePunctualityToday: BQ query failed: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+  if (!rows || rows.length === 0) {
+    // Edge case: arrancar el día sin ninguna hora cerrada aún (00:00-01:00).
+    // Escribimos doc vacío para que el cliente sepa que "HOY" está disponible
+    // pero sin data aún (todos los buckets `sparse: true`).
+    const result = aggregate([], {}, dateStr);
+    await admin
+      .firestore()
+      .collection("punctuality_today")
+      .doc("latest")
+      .set({
+        ...result,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        rowsTotal: 0,
+        indexedStops: 0,
+        bands: BANDS,
+        matchWindowMin: MATCH_WINDOW_MIN,
+        sparseBucketThreshold: SPARSE_BUCKET_THRESHOLD,
+        dateStrUY: dateStr,
+        computedInMs: Date.now() - startMs,
+      });
+    logger.info(`aggregatePunctualityToday ${dateStr}: 0 rows (probablemente arranque del día) — escribió doc vacío`);
+    return { ok: true, dateStr, rows: 0 };
+  }
+
+  const rawSchedules = await getStopSchedules();
+  const indexed = indexSchedules(rawSchedules);
+  const indexedStops = Object.keys(indexed).length;
+
+  const result = aggregate(rows, indexed, dateStr);
+  const computedInMs = Date.now() - startMs;
+
+  await admin
+    .firestore()
+    .collection("punctuality_today")
+    .doc("latest")
+    .set({
+      ...result,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      rowsTotal: rows.length,
+      indexedStops,
+      bands: BANDS,
+      matchWindowMin: MATCH_WINDOW_MIN,
+      sparseBucketThreshold: SPARSE_BUCKET_THRESHOLD,
+      dateStrUY: dateStr,
+      computedInMs,
+    });
+
+  logger.info(
+    `aggregatePunctualityToday ${dateStr}: ${rows.length} arribos hasta última hora cerrada, ` +
+    `matched=${result.totals.matched}, OTP green=${result.totals.green}/${result.totals.matched} ` +
+    `(${result.totals.greenPct !== null ? (result.totals.greenPct * 100).toFixed(1) : "—"}%) ` +
+    `en ${computedInMs}ms`
+  );
+  return {
+    ok: true,
+    dateStr,
+    rows: rows.length,
+    matched: result.totals.matched,
+    greenPct: result.totals.greenPct,
+    computedInMs,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Variante BY STOP — agregación por parada (Unif 21)
+// ─────────────────────────────────────────────────────────────────
+//
+// Para el widget "Tu parada en vivo" (data.chevamo.com.uy/parada).
+// Escribe 1 doc `punctuality_by_stop/latest` con un map `{stopId: stats}`
+// agregado de las últimas N horas (configurable). 1 write Firestore por
+// run, evita explosión de N=4937 writes individuales.
+//
+// Default: ventana últimas 24h (rolling desde NOW-24h, sin truncar). El
+// frontend muestra "arribos última hora" usando count + extrapolación o
+// hacemos query separada de 1h. Por ahora 24h da más samples por parada.
+
+function buildByStopQuery({ windowHours = 24 } = {}) {
+  const ds = `\`${BQ_PROJECT}.${BQ_DATASET}\``;
+  return `
+SELECT
+  ts,
+  line,
+  stopId,
+  EXTRACT(HOUR FROM ts AT TIME ZONE 'America/Montevideo') * 60
+    + EXTRACT(MINUTE FROM ts AT TIME ZONE 'America/Montevideo') AS uyMinuteOfDay,
+  EXTRACT(DAYOFWEEK FROM ts AT TIME ZONE 'America/Montevideo') - 1 AS uyDow
+FROM ${ds}.bus_arrivals
+WHERE ts > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${windowHours} HOUR)
+  AND eventType = 'arrived'
+  AND line IS NOT NULL AND line != ''
+  AND stopId IS NOT NULL AND stopId != ''
+LIMIT 5000000
+`.trim();
+}
+
+async function runByStopQuery(opts) {
+  const bq = getBqClient();
+  const [job] = await bq.createQueryJob({
+    query: buildByStopQuery(opts),
+    location: BQ_LOCATION,
+    useLegacySql: false,
+  });
+  const [rows] = await job.getQueryResults();
+  return rows;
+}
+
+/**
+ * Agrega arrivals por stopId. Para cada parada: count + OTP bandas
+ * (green, yellowEarly, yellowLate, redEarly, redLate) + líneas distintas
+ * vistas. Devuelve map `{stopId: stats}`.
+ *
+ * SPARSE_BUCKET_THRESHOLD adaptado: mínimo 10 arrivals para mostrar OTP%
+ * (sino los % son ruido). Sin matched suficiente, greenPct=null y el
+ * frontend muestra "Pocos datos".
+ */
+function aggregateByStop(rows, indexedSchedules) {
+  const byStop = {}; // { stopId: { matched, unmatched, green, yellow*, red*, lines: Set, total } }
+  const MIN_FOR_OTP = 10;
+
+  for (const row of rows) {
+    const stopId = String(row.stopId);
+    const line = String(row.line);
+    const uyDow = Number(row.uyDow);
+    const realMin = Number(row.uyMinuteOfDay);
+
+    if (!byStop[stopId]) {
+      byStop[stopId] = {
+        matched: 0, unmatched: 0,
+        green: 0, yellowEarly: 0, yellowLate: 0, redEarly: 0, redLate: 0,
+        total: 0, lines: new Set(),
+      };
+    }
+    const s = byStop[stopId];
+    s.total++;
+    s.lines.add(line);
+
+    const stopMap = indexedSchedules[stopId];
+    if (!stopMap) { s.unmatched++; continue; }
+    const lineMap = stopMap[line];
+    if (!lineMap) { s.unmatched++; continue; }
+    const calKey = calendarKeyFromDow(uyDow);
+    const arr = lineMap[calKey];
+    if (!arr) { s.unmatched++; continue; }
+    const delta = findClosestSchedule(realMin, arr);
+    if (delta === null) { s.unmatched++; continue; }
+
+    const cls = classify(delta);
+    s.matched++;
+    s[cls]++;
+  }
+
+  // Finalize: convert lines Set → count + array, compute OTP.
+  const out = {};
+  for (const [stopId, s] of Object.entries(byStop)) {
+    out[stopId] = {
+      total:        s.total,
+      matched:      s.matched,
+      unmatched:    s.unmatched,
+      green:        s.green,
+      yellowEarly:  s.yellowEarly,
+      yellowLate:   s.yellowLate,
+      redEarly:     s.redEarly,
+      redLate:      s.redLate,
+      linesCount:   s.lines.size,
+      greenPct:     s.matched >= MIN_FOR_OTP ? s.green / s.matched : null,
+      sparse:       s.matched < MIN_FOR_OTP,
+    };
+  }
+  return out;
+}
+
+async function runAndPersistByStop({ admin, getStopSchedules, windowHours = 24 } = {}) {
+  if (!admin) throw new Error("admin SDK requerido");
+  if (typeof getStopSchedules !== "function") {
+    throw new Error("getStopSchedules requerido");
+  }
+  const startMs = Date.now();
+  let rows;
+  try {
+    rows = await runByStopQuery({ windowHours });
+  } catch (e) {
+    logger.error(`aggregateByStop: BQ query failed: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+  if (!rows || rows.length === 0) {
+    logger.info(`aggregateByStop: 0 rows — skip`);
+    return { ok: true, rows: 0, skipped: "no rows" };
+  }
+  const rawSchedules = await getStopSchedules();
+  const indexed = indexSchedules(rawSchedules);
+  const byStop = aggregateByStop(rows, indexed);
+  const stopsCount = Object.keys(byStop).length;
+  const computedInMs = Date.now() - startMs;
+
+  // Firestore tiene límite 40k index entries por doc (no 1MB de payload).
+  // Con ~5000 stops × ~13 fields cada uno = 65k entries → excede.
+  // Solución: serializar `byStop` a JSON string (no indexable, no contribuye
+  // a index entries). El cliente parsea con JSON.parse local. Tradeoff:
+  // no podés query Firestore por byStop.X, pero como leemos el doc entero
+  // y filtramos local, no es problema.
+  const byStopJson = JSON.stringify(byStop);
+  await admin
+    .firestore()
+    .collection("punctuality_by_stop")
+    .doc("latest")
+    .set({
+      byStopJson,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      rowsTotal: rows.length,
+      stopsCount,
+      windowHours,
+      bands: BANDS,
+      minSamplesForOtp: 10,
+      computedInMs,
+    });
+
+  logger.info(
+    `aggregateByStop: ${rows.length} arribos sobre ${stopsCount} paradas ` +
+    `en ${windowHours}h, en ${computedInMs}ms`
+  );
+  return { ok: true, rows: rows.length, stopsCount, computedInMs };
+}
+
 module.exports = {
-  ON_TIME_THRESHOLD_MIN,
+  BANDS,
+  CATEGORIES,
+  BAND_GREEN_LO_SEC,
+  BAND_GREEN_HI_SEC,
+  BAND_YELLOW_LO_SEC,
+  BAND_YELLOW_HI_SEC,
+  BAND_RED_ABS_SEC,
   MATCH_WINDOW_MIN,
   SPARSE_BUCKET_THRESHOLD,
   COMPANY_KEYS,
   buildQuery,
   buildHourlyQuery,
+  buildRolling24hQuery,
+  buildTodayQuery,
   hhmmssToMinutes,
   indexSchedules,
   findClosestSchedule,
@@ -562,6 +1057,12 @@ module.exports = {
   aggregate,
   aggregateHourly,
   yesterdayDateStrUY,
+  todayDateStrUY,
   runAndPersist,
   runAndPersistHourly,
+  runAndPersistRolling24h,
+  runAndPersistToday,
+  buildByStopQuery,
+  aggregateByStop,
+  runAndPersistByStop,
 };

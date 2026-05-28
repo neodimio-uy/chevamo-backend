@@ -17,6 +17,7 @@
  */
 
 const { z } = require("zod");
+const { computeBusUid } = require("../bus-uid");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Box sanitizador Zod — shape conjunto IMM + stm-online normalizado
@@ -72,9 +73,19 @@ const ImmStmBusListRawSchema = z.array(ImmStmBusRawSchema);
 function mapImmStmBus(raw, ctx) {
   const [lng, lat] = raw.location.coordinates;
 
+  // Canonical busUid — único cross-empresa. Ver lib/bus-uid.js y
+  // feedback_canonical_bus_uid.md. Formato:
+  //   ${feedSource}:${company}:${busId}:${lineVariantId}
+  const busUid = computeBusUid({
+    company:       raw.company,
+    busId:         raw.busId,
+    lineVariantId: raw.lineVariantId,
+  }, ctx.feedSource);
+
   // IMM no expone direction explícita. routeShortName == line para STM.
   return {
     id:         `${ctx.feedSource}:${raw.busId}`,
+    busUid,
     feedSource: ctx.feedSource,
     cityId:     ctx.cityId,
     mode:       ctx.mode,
