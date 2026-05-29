@@ -35,6 +35,27 @@ const positionFuser = require("./position-fuser");
 const sourceConfidence = require("./source-confidence");
 const clusterer = require("./community-clusterer");
 const { computeBusUid } = require("./bus-uid");
+const speedHist = require("./eta-speed-hist");
+
+/**
+ * Fallback v_hist server-side (Smart ETA v2, ver chevamo-docs/eta/ §11):
+ * cuando NO hay base IMM ni Google, estimar el ETA con dist-a-parada /
+ * velocidad histórica de la línea. Default OFF; reactivable con
+ * ETA_SERVER_SPEED_MODEL=true. Aditivo: solo afecta buses que hoy se sirven
+ * sin ETA ("none").
+ */
+const SERVER_SPEED_MODEL = process.env.ETA_SERVER_SPEED_MODEL === "true";
+
+/** Haversine en metros (solo para el fallback v_hist; el path IMM ya conoce la ruta). */
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
 
 /** Cota inferior absoluta del etaFinal — buses dentro del minuto siguiente
  *  igual se reportan como "1 min" (Math.max(1, …) en el stabilizer). */
@@ -215,8 +236,32 @@ function matchCluster({ bus, clustersByLine, immAgeSec, now }) {
  *     posición fusionada (mejor render en mapa). El ETA NO se recalcula —
  *     se respeta el ETA IMM como hace iOS en officialWithConfirmations.
  */
-async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersByLine, immAgeSec = 30 }) {
-  const { baseEtaSec, source: baseSource } = pickBase(bus);
+async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersByLine, immAgeSec = 30, stopCoord = null }) {
+  let { baseEtaSec, source: baseSource } = pickBase(bus);
+
+  // Fallback v_hist server-side: si no hay base IMM ni Google y el flag está ON,
+  // estimar dist-a-parada / velocidad histórica de la línea (GPS-derivada, robusta
+  // ante bus parado — no usa velocidad instantánea con floor). Hoy estos buses se
+  // devuelven sin ETA; cualquier estimación razonable es mejor que nada. OFF por
+  // default (ETA_SERVER_SPEED_MODEL).
+  let vhistMeta = null;
+  if (baseEtaSec == null && SERVER_SPEED_MODEL && stopCoord &&
+      bus.location && Array.isArray(bus.location.coordinates) && bus.line) {
+    const [blng, blat] = bus.location.coordinates;
+    if (Number.isFinite(blat) && Number.isFinite(blng) &&
+        Number.isFinite(stopCoord.lat) && Number.isFinite(stopCoord.lng)) {
+      const distM = haversineMeters(blat, blng, stopCoord.lat, stopCoord.lng);
+      const hourBand = ctx.hourToBand(ctx.uyHour(now));
+      const { speedKmh, source: vhistSrc } =
+        await speedHist.speedForLineHour({ line: bus.line, hourBand, admin });
+      const est = distM / (speedKmh / 3.6);
+      if (Number.isFinite(est) && est > 0) {
+        baseEtaSec = est;
+        baseSource = "vhist";
+        vhistMeta = { distM: Math.round(distM), speedKmh, vhistSrc };
+      }
+    }
+  }
 
   if (baseEtaSec == null) {
     return {
@@ -326,6 +371,7 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
     result._etaTelemetry = {
       baseEtaSec,
       baseSource,
+      ...(vhistMeta && { vhist: vhistMeta }),
       hourMul,
       dayMul,
       weatherMul,
@@ -367,6 +413,7 @@ async function fuseBuses({
   compareMode = false,
   clustersByLine,
   immAgeSec = 30,
+  stopCoord = null,
 }) {
   if (!Array.isArray(buses) || buses.length === 0) return [];
   // Pre-cargar buckets de calibration (single IO + cache TTL 5min).
@@ -375,7 +422,7 @@ async function fuseBuses({
     admin,
   });
   return Promise.all(
-    buses.map((bus) => fuseBus({ bus, stopId, now, admin, compareMode, clustersByLine, immAgeSec })),
+    buses.map((bus) => fuseBus({ bus, stopId, now, admin, compareMode, clustersByLine, immAgeSec, stopCoord })),
   );
 }
 

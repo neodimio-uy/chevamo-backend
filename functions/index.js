@@ -2759,6 +2759,9 @@ exports.api = onRequest({
             admin,
             compareMode,
             clustersByLine,
+            // Coords de la parada para el fallback v_hist server-side (solo
+            // cuando el cliente las envía). Sin ellas, fuseBus omite el fallback.
+            stopCoord: wantsTraffic ? { lat: stopLat, lng: stopLng } : null,
           });
           pipelineSource += "+fusion";
         } catch (fusionErr) {
@@ -5637,6 +5640,22 @@ exports.aggregateEtaFactorsFromBq = onSchedule(
   },
   async () => {
     await etaBqAggregator.runAndPersist({ admin });
+  }
+);
+
+// v_hist (velocidad histórica línea×hora, GPS-derivada) — palanca #1 Smart ETA v2
+// (ver chevamo-docs/eta/). BQ → Firestore system/eta_speed_by_line_hour, leído
+// por lib/eta-speed-hist.js. GPS-derivada (distFromPrevM/secsSincePrev) porque el
+// campo de velocidad de la IMM es poco confiable punto-a-punto. Idempotente.
+const speedHistAggregator = require("./lib/eta-speed-hist-aggregator");
+exports.aggregateLineSpeedHist = onSchedule(
+  {
+    schedule: "every 6 hours",
+    memory: "512MiB",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    await speedHistAggregator.runAndPersist({ admin });
   }
 );
 
