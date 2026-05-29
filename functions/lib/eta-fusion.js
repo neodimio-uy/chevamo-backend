@@ -46,6 +46,16 @@ const TRAFFIC_FACTOR_BOUNDS = [0.5, 2.0];
 /** Umbral para considerar "tráfico anormal" (delta Google vs IMM). */
 const TRAFFIC_DELTA_THRESHOLD_SEC = 60;
 
+/**
+ * ¿Aplicar el `trafficFactor` (Google Distance Matrix) al ETA servido?
+ * Default OFF: la medición sobre el banco eta_eval (21.75M pares, 2026-05-29)
+ * mostró que el trafficFactor naive EMPEORA el ETA servido (MAE 121s vs 30s del
+ * IMM puro). Se sigue computando para telemetría/A-B y se deja `googleEtaSec`
+ * logueado; reactivar con ETA_TRAFFIC_FACTOR_ENABLED=true solo si una medición
+ * futura demuestra que aporta (idealmente como feature de modelo, no multiplier).
+ */
+const TRAFFIC_FACTOR_ENABLED = process.env.ETA_TRAFFIC_FACTOR_ENABLED === "true";
+
 function clamp(v, lo, hi) {
   return Math.min(Math.max(v, lo), hi);
 }
@@ -63,7 +73,12 @@ function clamp(v, lo, hi) {
  * eso vía `trafficFactor` aplicado a la base IMM, no reemplazando.
  */
 function pickBase(bus) {
-  if (typeof bus.eta === "number" && bus.eta > 0) {
+  // `>= 0`: la IMM emite `eta: 0` para buses que están llegando AHORA (ej. un
+  // bus a ~114m que declara la línea). El `> 0` estricto los descartaba → caían
+  // a Google/none y desaparecían de /upcoming pese a estar presentes. Con 0,
+  // baseEtaSec=0 → tras multipliers y el piso MIN_ETA_SEC se sirve como ~30s
+  // ("llegando"), que es lo correcto. Ver audit Unif 20 (eta:0 descartado).
+  if (typeof bus.eta === "number" && bus.eta >= 0) {
     return { baseEtaSec: bus.eta, source: "imm" };
   }
   if (typeof bus.googleEtaSec === "number" && bus.googleEtaSec > 0) {
@@ -225,8 +240,12 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
   const dayMul = ctx.weekdayMultiplier(now);
   const weatherMul = ctx.weatherMultiplier("none"); // Sprint 0+1 traerá rain real
 
-  // Traffic factor (proxy weather + tráfico + eventos vía Google)
-  const { factor: trafficFactor, applied: trafficApplied } = computeTrafficFactor(bus);
+  // Traffic factor (proxy weather + tráfico + eventos vía Google). Se computa
+  // SIEMPRE (telemetría/A-B) pero solo se APLICA si TRAFFIC_FACTOR_ENABLED.
+  // Por evidencia (banco eta_eval), aplicarlo naive empeora el ETA → default OFF.
+  const { factor: trafficFactorRaw, applied: trafficAppliedRaw } = computeTrafficFactor(bus);
+  const trafficFactor = TRAFFIC_FACTOR_ENABLED ? trafficFactorRaw : 1.0;
+  const trafficApplied = TRAFFIC_FACTOR_ENABLED ? trafficAppliedRaw : false;
 
   // Calibration bucket cascada
   const bucket = {
@@ -312,6 +331,9 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
       weatherMul,
       trafficFactor,
       trafficApplied,
+      trafficFactorRaw,
+      trafficAppliedRaw,
+      trafficFactorEnabled: TRAFFIC_FACTOR_ENABLED,
       calibFactor,
       calibSource,
       bucket,
