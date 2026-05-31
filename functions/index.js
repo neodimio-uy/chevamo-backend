@@ -5659,6 +5659,22 @@ exports.aggregateLineSpeedHist = onSchedule(
   }
 );
 
+// Sonda sintética de ETA (Smart ETA v2): llama /upcoming sobre una muestra de
+// paradas para generar predicciones en eta_requests y destrabar la medición de
+// fiabilidad pre-launch (sin tráfico real de usuarios). Pega al run.app directo
+// (saltea CDN). Solo horario de servicio. Ver lib/eta-prober.js + chevamo-docs/eta/.
+const etaProber = require("./lib/eta-prober");
+exports.probeEtaSamples = onSchedule(
+  {
+    schedule: "every 15 minutes",
+    memory: "256MiB",
+    timeoutSeconds: 120,
+  },
+  async () => {
+    await etaProber.runProbe();
+  }
+);
+
 // Puntualidad diaria — corre 5 AM UY (8 AM UTC) para tener el día UY
 // anterior completo en BQ. Memoria alta porque carga stop-schedules.json
 // (~24MB) e indexa 4901 paradas × N líneas en memoria.
