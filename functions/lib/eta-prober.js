@@ -28,9 +28,15 @@ const { logger } = require("firebase-functions");
 
 // URL directo de Cloud Run (saltea CDN). Override por env si cambia la revisión.
 const SELF_BASE = process.env.ETA_PROBE_BASE || "https://api-uz7smrj4ua-rj.a.run.app";
-const SAMPLE_SIZE = Number(process.env.ETA_PROBE_SAMPLE || 25);
+const SAMPLE_SIZE = Number(process.env.ETA_PROBE_SAMPLE || 20);
+// Las llamadas se hacen SECUENCIALES con esta pausa entre cada una. Medido:
+// una ráfaga de ~12 /upcoming seguidas devuelve 502 (estrés api/IMM). Secuencial
+// + ~600ms espacia 20 llamadas en ~15-20s y no estresa el upstream IMM.
+const THROTTLE_MS = Number(process.env.ETA_PROBE_THROTTLE_MS || 600);
 const SERVICE_START_UY = 6;
 const SERVICE_END_UY = 23;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Hora de Uruguay (UTC-3, sin DST desde 2015). */
 function uyHour(now) {
@@ -79,25 +85,26 @@ async function runProbe({ now = new Date(), sampleSize = SAMPLE_SIZE } = {}) {
   const picked = sampleK(stops, sampleSize);
   let ok = 0;
   let err = 0;
-  await Promise.all(
-    picked.map(async (s) => {
-      const id = s.busstopId ?? s.id ?? s.stopId;
-      const [lng, lat] = s.location.coordinates;
-      if (id == null || !Number.isFinite(lat) || !Number.isFinite(lng)) { err++; return; }
-      try {
-        // Sin stopLat/stopLng a propósito: evita el costo de Google Distance
-        // Matrix. El ETA servido de los buses IMM no depende de coords (traffic
-        // gateado OFF). amount=3 buses/línea como la app.
-        await axios.get(`${SELF_BASE}/busstops/${id}/upcoming`, {
-          params: { amount: 3 },
-          timeout: 12000,
-        });
-        ok++;
-      } catch (e) {
-        err++;
-      }
-    })
-  );
+  // SECUENCIAL con throttle (no Promise.all): una ráfaga concurrente devuelve
+  // 502 (estrés api/IMM). Espaciar protege el upstream IMM y a usuarios reales.
+  for (const s of picked) {
+    const id = s.busstopId ?? s.id ?? s.stopId;
+    const [lng, lat] = s.location.coordinates;
+    if (id == null || !Number.isFinite(lat) || !Number.isFinite(lng)) { err++; continue; }
+    try {
+      // Sin stopLat/stopLng a propósito: evita el costo de Google Distance
+      // Matrix. El ETA servido de los buses IMM no depende de coords (traffic
+      // gateado OFF). amount=3 buses/línea como la app.
+      await axios.get(`${SELF_BASE}/busstops/${id}/upcoming`, {
+        params: { amount: 3 },
+        timeout: 12000,
+      });
+      ok++;
+    } catch (e) {
+      err++;
+    }
+    await sleep(THROTTLE_MS);
+  }
   logger.info(`probeEtaSamples: ${ok} paradas sondeadas (${err} errores) de ${picked.length} · ${h}h UY`);
   return { ok: true, probed: ok, errors: err, sampled: picked.length };
 }
