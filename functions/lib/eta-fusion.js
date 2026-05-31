@@ -35,6 +35,27 @@ const positionFuser = require("./position-fuser");
 const sourceConfidence = require("./source-confidence");
 const clusterer = require("./community-clusterer");
 const { computeBusUid } = require("./bus-uid");
+const speedHist = require("./eta-speed-hist");
+
+/**
+ * Fallback v_hist server-side (Smart ETA v2, ver chevamo-docs/eta/ §11):
+ * cuando NO hay base IMM ni Google, estimar el ETA con dist-a-parada /
+ * velocidad histórica de la línea. Default OFF; reactivable con
+ * ETA_SERVER_SPEED_MODEL=true. Aditivo: solo afecta buses que hoy se sirven
+ * sin ETA ("none").
+ */
+const SERVER_SPEED_MODEL = process.env.ETA_SERVER_SPEED_MODEL === "true";
+
+/** Haversine en metros (solo para el fallback v_hist; el path IMM ya conoce la ruta). */
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
 
 /** Cota inferior absoluta del etaFinal — buses dentro del minuto siguiente
  *  igual se reportan como "1 min" (Math.max(1, …) en el stabilizer). */
@@ -45,6 +66,16 @@ const TRAFFIC_FACTOR_BOUNDS = [0.5, 2.0];
 
 /** Umbral para considerar "tráfico anormal" (delta Google vs IMM). */
 const TRAFFIC_DELTA_THRESHOLD_SEC = 60;
+
+/**
+ * ¿Aplicar el `trafficFactor` (Google Distance Matrix) al ETA servido?
+ * Default OFF: la medición sobre el banco eta_eval (21.75M pares, 2026-05-29)
+ * mostró que el trafficFactor naive EMPEORA el ETA servido (MAE 121s vs 30s del
+ * IMM puro). Se sigue computando para telemetría/A-B y se deja `googleEtaSec`
+ * logueado; reactivar con ETA_TRAFFIC_FACTOR_ENABLED=true solo si una medición
+ * futura demuestra que aporta (idealmente como feature de modelo, no multiplier).
+ */
+const TRAFFIC_FACTOR_ENABLED = process.env.ETA_TRAFFIC_FACTOR_ENABLED === "true";
 
 function clamp(v, lo, hi) {
   return Math.min(Math.max(v, lo), hi);
@@ -63,7 +94,12 @@ function clamp(v, lo, hi) {
  * eso vía `trafficFactor` aplicado a la base IMM, no reemplazando.
  */
 function pickBase(bus) {
-  if (typeof bus.eta === "number" && bus.eta > 0) {
+  // `>= 0`: la IMM emite `eta: 0` para buses que están llegando AHORA (ej. un
+  // bus a ~114m que declara la línea). El `> 0` estricto los descartaba → caían
+  // a Google/none y desaparecían de /upcoming pese a estar presentes. Con 0,
+  // baseEtaSec=0 → tras multipliers y el piso MIN_ETA_SEC se sirve como ~30s
+  // ("llegando"), que es lo correcto. Ver audit Unif 20 (eta:0 descartado).
+  if (typeof bus.eta === "number" && bus.eta >= 0) {
     return { baseEtaSec: bus.eta, source: "imm" };
   }
   if (typeof bus.googleEtaSec === "number" && bus.googleEtaSec > 0) {
@@ -200,8 +236,32 @@ function matchCluster({ bus, clustersByLine, immAgeSec, now }) {
  *     posición fusionada (mejor render en mapa). El ETA NO se recalcula —
  *     se respeta el ETA IMM como hace iOS en officialWithConfirmations.
  */
-async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersByLine, immAgeSec = 30 }) {
-  const { baseEtaSec, source: baseSource } = pickBase(bus);
+async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersByLine, immAgeSec = 30, stopCoord = null }) {
+  let { baseEtaSec, source: baseSource } = pickBase(bus);
+
+  // Fallback v_hist server-side: si no hay base IMM ni Google y el flag está ON,
+  // estimar dist-a-parada / velocidad histórica de la línea (GPS-derivada, robusta
+  // ante bus parado — no usa velocidad instantánea con floor). Hoy estos buses se
+  // devuelven sin ETA; cualquier estimación razonable es mejor que nada. OFF por
+  // default (ETA_SERVER_SPEED_MODEL).
+  let vhistMeta = null;
+  if (baseEtaSec == null && SERVER_SPEED_MODEL && stopCoord &&
+      bus.location && Array.isArray(bus.location.coordinates) && bus.line) {
+    const [blng, blat] = bus.location.coordinates;
+    if (Number.isFinite(blat) && Number.isFinite(blng) &&
+        Number.isFinite(stopCoord.lat) && Number.isFinite(stopCoord.lng)) {
+      const distM = haversineMeters(blat, blng, stopCoord.lat, stopCoord.lng);
+      const hourBand = ctx.hourToBand(ctx.uyHour(now));
+      const { speedKmh, source: vhistSrc } =
+        await speedHist.speedForLineHour({ line: bus.line, hourBand, admin });
+      const est = distM / (speedKmh / 3.6);
+      if (Number.isFinite(est) && est > 0) {
+        baseEtaSec = est;
+        baseSource = "vhist";
+        vhistMeta = { distM: Math.round(distM), speedKmh, vhistSrc };
+      }
+    }
+  }
 
   if (baseEtaSec == null) {
     return {
@@ -225,8 +285,12 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
   const dayMul = ctx.weekdayMultiplier(now);
   const weatherMul = ctx.weatherMultiplier("none"); // Sprint 0+1 traerá rain real
 
-  // Traffic factor (proxy weather + tráfico + eventos vía Google)
-  const { factor: trafficFactor, applied: trafficApplied } = computeTrafficFactor(bus);
+  // Traffic factor (proxy weather + tráfico + eventos vía Google). Se computa
+  // SIEMPRE (telemetría/A-B) pero solo se APLICA si TRAFFIC_FACTOR_ENABLED.
+  // Por evidencia (banco eta_eval), aplicarlo naive empeora el ETA → default OFF.
+  const { factor: trafficFactorRaw, applied: trafficAppliedRaw } = computeTrafficFactor(bus);
+  const trafficFactor = TRAFFIC_FACTOR_ENABLED ? trafficFactorRaw : 1.0;
+  const trafficApplied = TRAFFIC_FACTOR_ENABLED ? trafficAppliedRaw : false;
 
   // Calibration bucket cascada
   const bucket = {
@@ -307,11 +371,15 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
     result._etaTelemetry = {
       baseEtaSec,
       baseSource,
+      ...(vhistMeta && { vhist: vhistMeta }),
       hourMul,
       dayMul,
       weatherMul,
       trafficFactor,
       trafficApplied,
+      trafficFactorRaw,
+      trafficAppliedRaw,
+      trafficFactorEnabled: TRAFFIC_FACTOR_ENABLED,
       calibFactor,
       calibSource,
       bucket,
@@ -345,6 +413,7 @@ async function fuseBuses({
   compareMode = false,
   clustersByLine,
   immAgeSec = 30,
+  stopCoord = null,
 }) {
   if (!Array.isArray(buses) || buses.length === 0) return [];
   // Pre-cargar buckets de calibration (single IO + cache TTL 5min).
@@ -353,7 +422,7 @@ async function fuseBuses({
     admin,
   });
   return Promise.all(
-    buses.map((bus) => fuseBus({ bus, stopId, now, admin, compareMode, clustersByLine, immAgeSec })),
+    buses.map((bus) => fuseBus({ bus, stopId, now, admin, compareMode, clustersByLine, immAgeSec, stopCoord })),
   );
 }
 
