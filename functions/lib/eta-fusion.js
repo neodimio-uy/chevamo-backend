@@ -244,9 +244,13 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
   // ante bus parado — no usa velocidad instantánea con floor). Hoy estos buses se
   // devuelven sin ETA; cualquier estimación razonable es mejor que nada. OFF por
   // default (ETA_SERVER_SPEED_MODEL).
-  let vhistMeta = null;
-  if (baseEtaSec == null && SERVER_SPEED_MODEL && stopCoord &&
-      bus.location && Array.isArray(bus.location.coordinates) && bus.line) {
+  // Estimación v_hist (dist-a-parada / velocidad histórica de la línea, GPS-derivada).
+  // Se computa SIEMPRE para A/B: loggear etaVhist JUNTO al etaFinal servido y comparar
+  // ambos contra los arribos reales. Usa las coords de la parada del CATÁLOGO server-side
+  // (NO dispara Google Distance Matrix). El SERVIDO sigue siendo IMM; v_hist solo se
+  // SIRVE como fallback cuando no hay base IMM/Google y ETA_SERVER_SPEED_MODEL=true.
+  let vhist = null;
+  if (stopCoord && bus.location && Array.isArray(bus.location.coordinates) && bus.line) {
     const [blng, blat] = bus.location.coordinates;
     if (Number.isFinite(blat) && Number.isFinite(blng) &&
         Number.isFinite(stopCoord.lat) && Number.isFinite(stopCoord.lng)) {
@@ -256,11 +260,15 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
         await speedHist.speedForLineHour({ line: bus.line, hourBand, admin });
       const est = distM / (speedKmh / 3.6);
       if (Number.isFinite(est) && est > 0) {
-        baseEtaSec = est;
-        baseSource = "vhist";
-        vhistMeta = { distM: Math.round(distM), speedKmh, vhistSrc };
+        vhist = { etaVhistSec: Math.round(est), distM: Math.round(distM), speedKmh, vhistSrc };
       }
     }
+  }
+
+  // Fallback de SERVIDO: si no hay base IMM/Google y el flag está ON, servir v_hist.
+  if (baseEtaSec == null && SERVER_SPEED_MODEL && vhist) {
+    baseEtaSec = vhist.etaVhistSec;
+    baseSource = "vhist";
   }
 
   if (baseEtaSec == null) {
@@ -269,6 +277,7 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
       etaFinalSec: null,
       etaSource: "none",
       etaConfidence: 0,
+      ...(vhist && { _vhist: vhist }),
       ...(compareMode && {
         _etaTelemetry: { reason: "no-base-eta" },
       }),
@@ -357,6 +366,8 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
     etaFinalSec: etaFinalMin * 60,
     etaSource,
     etaConfidence,
+    // A/B v_hist: estimación alternativa logueada (NO cambia el ETA servido).
+    ...(vhist && { _vhist: vhist }),
     // Sprint 0+1: enriquecimiento comunidad (mirror de iOS).
     ...(communityMatch && {
       communityConfirmations: communityMatch.cluster.reporterCount,
@@ -371,7 +382,7 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
     result._etaTelemetry = {
       baseEtaSec,
       baseSource,
-      ...(vhistMeta && { vhist: vhistMeta }),
+      ...(vhist && { vhist }),
       hourMul,
       dayMul,
       weatherMul,

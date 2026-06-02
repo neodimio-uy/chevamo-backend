@@ -1,37 +1,188 @@
 [
-  { "name": "ts", "type": "TIMESTAMP", "mode": "REQUIRED", "description": "Timestamp del request (server time)." },
-  { "name": "stopId", "type": "STRING", "mode": "REQUIRED", "description": "ID de la parada (busstopId IMM Mvd)." },
-  { "name": "path", "type": "STRING", "mode": "NULLABLE", "description": "Path del handler que emitió el evento, ej '/busstops/:id/upcoming'." },
-  { "name": "wantsTraffic", "type": "BOOL", "mode": "NULLABLE", "description": "Si el request solicitó enrichment con Google traffic." },
-  { "name": "compareMode", "type": "BOOL", "mode": "NULLABLE", "description": "Si vino con ?compare=1 (debug mode con telemetry adicional)." },
-  { "name": "hasAppCheckToken", "type": "BOOL", "mode": "NULLABLE", "description": "Si el request trajo token App Check válido." },
-  { "name": "hasIdToken", "type": "BOOL", "mode": "NULLABLE", "description": "Si el request trajo Firebase Auth ID token." },
-  { "name": "uid", "type": "STRING", "mode": "NULLABLE", "description": "UID del usuario autenticado (nullable)." },
-  { "name": "pipelineSource", "type": "STRING", "mode": "NULLABLE", "description": "Origen del pipeline aplicado: 'imm+fusion', 'imm+traffic+fusion', etc." },
-  { "name": "busCount", "type": "INT64", "mode": "NULLABLE", "description": "Cantidad de buses devueltos en la respuesta." },
-  { "name": "uyHour", "type": "INT64", "mode": "NULLABLE", "description": "Hora local UY (0-23) al momento del request." },
-  { "name": "uyHourBand", "type": "INT64", "mode": "NULLABLE", "description": "Banda horaria (índice 0-3 según mapping de eta-context)." },
-  { "name": "uyDayKind", "type": "STRING", "mode": "NULLABLE", "description": "Tipo de día UY: 'weekday' | 'saturday' | 'sunday' | 'holiday'." },
+  {
+    "name": "ts",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Timestamp del request (server time)."
+  },
+  {
+    "name": "stopId",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "ID de la parada (busstopId IMM Mvd)."
+  },
+  {
+    "name": "path",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Path del handler que emitió el evento, ej '/busstops/:id/upcoming'."
+  },
+  {
+    "name": "wantsTraffic",
+    "type": "BOOL",
+    "mode": "NULLABLE",
+    "description": "Si el request solicitó enrichment con Google traffic."
+  },
+  {
+    "name": "compareMode",
+    "type": "BOOL",
+    "mode": "NULLABLE",
+    "description": "Si vino con ?compare=1 (debug mode con telemetry adicional)."
+  },
+  {
+    "name": "hasAppCheckToken",
+    "type": "BOOL",
+    "mode": "NULLABLE",
+    "description": "Si el request trajo token App Check válido."
+  },
+  {
+    "name": "hasIdToken",
+    "type": "BOOL",
+    "mode": "NULLABLE",
+    "description": "Si el request trajo Firebase Auth ID token."
+  },
+  {
+    "name": "uid",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "UID del usuario autenticado (nullable)."
+  },
+  {
+    "name": "pipelineSource",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Origen del pipeline aplicado: 'imm+fusion', 'imm+traffic+fusion', etc."
+  },
+  {
+    "name": "busCount",
+    "type": "INT64",
+    "mode": "NULLABLE",
+    "description": "Cantidad de buses devueltos en la respuesta."
+  },
+  {
+    "name": "uyHour",
+    "type": "INT64",
+    "mode": "NULLABLE",
+    "description": "Hora local UY (0-23) al momento del request."
+  },
+  {
+    "name": "uyHourBand",
+    "type": "INT64",
+    "mode": "NULLABLE",
+    "description": "Banda horaria (índice 0-3 según mapping de eta-context)."
+  },
+  {
+    "name": "uyDayKind",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Tipo de día UY: 'weekday' | 'saturday' | 'sunday' | 'holiday'."
+  },
   {
     "name": "buses",
     "type": "RECORD",
     "mode": "REPEATED",
     "description": "Buses devueltos en la respuesta, uno por elemento.",
     "fields": [
-      { "name": "busId", "type": "STRING", "mode": "NULLABLE", "description": "LEGACY — usar busUid para lookups/JOINs." },
-      { "name": "busUid", "type": "STRING", "mode": "NULLABLE", "description": "Canonical busUid cross-empresa: 'feedSource:company:busId:lineVariantId'. Resuelve colisión 203 busIds entre cooperativas. Unif 21." },
-      { "name": "line", "type": "STRING", "mode": "NULLABLE" },
-      { "name": "etaRaw", "type": "INT64", "mode": "NULLABLE", "description": "ETA crudo IMM en segundos." },
-      { "name": "googleEtaSec", "type": "INT64", "mode": "NULLABLE", "description": "ETA Google Distance Matrix en segundos (si fue computado)." },
-      { "name": "etaFinalSec", "type": "INT64", "mode": "NULLABLE", "description": "ETA fusion final en segundos (output del pipeline)." },
-      { "name": "etaSource", "type": "STRING", "mode": "NULLABLE", "description": "Fuente predominante del ETA final: 'imm' | 'google' | 'community' | 'fusion'." },
-      { "name": "etaConfidence", "type": "FLOAT64", "mode": "NULLABLE", "description": "Confianza 0-1 del ETA final." },
-      { "name": "lat", "type": "FLOAT64", "mode": "NULLABLE" },
-      { "name": "lng", "type": "FLOAT64", "mode": "NULLABLE" },
-      { "name": "speedKmh", "type": "FLOAT64", "mode": "NULLABLE" },
-      { "name": "calibFactor", "type": "FLOAT64", "mode": "NULLABLE", "description": "Factor de calibración bucket aplicado." },
-      { "name": "calibSource", "type": "STRING", "mode": "NULLABLE", "description": "Origen del calibFactor: 'exact' | 'parent' | 'grandpa' | 'none'." },
-      { "name": "trafficFactor", "type": "FLOAT64", "mode": "NULLABLE", "description": "Factor tráfico (googleEta / immEta) clamped [0.5, 2.0]." }
+      {
+        "name": "busId",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "LEGACY — usar busUid para lookups/JOINs."
+      },
+      {
+        "name": "busUid",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Canonical busUid cross-empresa: 'feedSource:company:busId:lineVariantId'. Resuelve colisión 203 busIds entre cooperativas. Unif 21."
+      },
+      {
+        "name": "line",
+        "type": "STRING",
+        "mode": "NULLABLE"
+      },
+      {
+        "name": "etaRaw",
+        "type": "INT64",
+        "mode": "NULLABLE",
+        "description": "ETA crudo IMM en segundos."
+      },
+      {
+        "name": "googleEtaSec",
+        "type": "INT64",
+        "mode": "NULLABLE",
+        "description": "ETA Google Distance Matrix en segundos (si fue computado)."
+      },
+      {
+        "name": "etaFinalSec",
+        "type": "INT64",
+        "mode": "NULLABLE",
+        "description": "ETA fusion final en segundos (output del pipeline)."
+      },
+      {
+        "name": "etaSource",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Fuente predominante del ETA final: 'imm' | 'google' | 'community' | 'fusion'."
+      },
+      {
+        "name": "etaConfidence",
+        "type": "FLOAT64",
+        "mode": "NULLABLE",
+        "description": "Confianza 0-1 del ETA final."
+      },
+      {
+        "name": "lat",
+        "type": "FLOAT64",
+        "mode": "NULLABLE"
+      },
+      {
+        "name": "lng",
+        "type": "FLOAT64",
+        "mode": "NULLABLE"
+      },
+      {
+        "name": "speedKmh",
+        "type": "FLOAT64",
+        "mode": "NULLABLE"
+      },
+      {
+        "name": "calibFactor",
+        "type": "FLOAT64",
+        "mode": "NULLABLE",
+        "description": "Factor de calibración bucket aplicado."
+      },
+      {
+        "name": "calibSource",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Origen del calibFactor: 'exact' | 'parent' | 'grandpa' | 'none'."
+      },
+      {
+        "name": "trafficFactor",
+        "type": "FLOAT64",
+        "mode": "NULLABLE",
+        "description": "Factor tráfico (googleEta / immEta) clamped [0.5, 2.0]."
+      },
+      {
+        "name": "etaVhistSec",
+        "type": "INT64",
+        "mode": "NULLABLE"
+      },
+      {
+        "name": "distM",
+        "type": "INT64",
+        "mode": "NULLABLE"
+      },
+      {
+        "name": "vhistSpeedKmh",
+        "type": "FLOAT64",
+        "mode": "NULLABLE"
+      },
+      {
+        "name": "vhistSource",
+        "type": "STRING",
+        "mode": "NULLABLE"
+      }
     ]
   }
 ]

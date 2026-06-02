@@ -36,6 +36,16 @@ const THROTTLE_MS = Number(process.env.ETA_PROBE_THROTTLE_MS || 600);
 const SERVICE_START_UY = 6;
 const SERVICE_END_UY = 23;
 
+// Lista fija de paradas a sondear: top-100 + bottom-100 por arribos (bundleada,
+// eta-probe-stops.json). Si existe, se sondean esas 200; sino, fallback a sample
+// aleatorio del catálogo. Mide el ETA en los dos extremos (céntricas vs tranquilas).
+let PROBE_STOPS = null;
+try {
+  const list = require("../eta-probe-stops.json");
+  PROBE_STOPS = [...(list.top100 || []), ...(list.bottom100 || [])].map(String);
+  if (!PROBE_STOPS.length) PROBE_STOPS = null;
+} catch (e) { PROBE_STOPS = null; }
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Hora de Uruguay (UTC-3, sin DST desde 2015). */
@@ -68,33 +78,35 @@ async function runProbe({ now = new Date(), sampleSize = SAMPLE_SIZE } = {}) {
   if (h < SERVICE_START_UY || h >= SERVICE_END_UY) {
     return { skipped: `fuera de horario de servicio (${h}h UY)` };
   }
-  _seed = (now.getUTCMinutes() + 1) * 2654435761 & 0x7fffffff;
 
-  // 1) Catálogo de paradas (con coords). Vía run.app directo.
-  let stops;
-  try {
-    const { data } = await axios.get(`${SELF_BASE}/busstops`, { timeout: 15000 });
-    const list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
-    stops = list.filter((s) => Array.isArray(s?.location?.coordinates) && s.location.coordinates.length === 2);
-  } catch (e) {
-    logger.warn(`probeEtaSamples: no se pudo cargar /busstops: ${e.message}`);
-    return { ok: false, error: "busstops fetch failed" };
+  // Resolver los stopIds: lista fija (top/bottom 100) o sample aleatorio del catálogo.
+  let ids;
+  if (PROBE_STOPS) {
+    ids = PROBE_STOPS;
+  } else {
+    _seed = (now.getUTCMinutes() + 1) * 2654435761 & 0x7fffffff;
+    try {
+      const { data } = await axios.get(`${SELF_BASE}/busstops`, { timeout: 15000 });
+      const list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
+      const stops = list.filter((s) => Array.isArray(s?.location?.coordinates));
+      ids = sampleK(stops, sampleSize)
+        .map((s) => s.busstopId ?? s.id ?? s.stopId)
+        .filter((x) => x != null)
+        .map(String);
+    } catch (e) {
+      logger.warn(`probeEtaSamples: no se pudo cargar /busstops: ${e.message}`);
+      return { ok: false, error: "busstops fetch failed" };
+    }
   }
-  if (!stops.length) return { skipped: "catálogo de paradas vacío" };
+  if (!ids.length) return { skipped: "sin paradas a sondear" };
 
-  const picked = sampleK(stops, sampleSize);
   let ok = 0;
   let err = 0;
-  // SECUENCIAL con throttle (no Promise.all): una ráfaga concurrente devuelve
-  // 502 (estrés api/IMM). Espaciar protege el upstream IMM y a usuarios reales.
-  for (const s of picked) {
-    const id = s.busstopId ?? s.id ?? s.stopId;
-    const [lng, lat] = s.location.coordinates;
-    if (id == null || !Number.isFinite(lat) || !Number.isFinite(lng)) { err++; continue; }
+  // SECUENCIAL con throttle (no Promise.all): una ráfaga concurrente devuelve 502
+  // (estrés api/IMM). SIN coords: el v_hist usa las coords del catálogo server-side
+  // (no dispara Google Distance Matrix). amount=3 como la app.
+  for (const id of ids) {
     try {
-      // Sin stopLat/stopLng a propósito: evita el costo de Google Distance
-      // Matrix. El ETA servido de los buses IMM no depende de coords (traffic
-      // gateado OFF). amount=3 buses/línea como la app.
       await axios.get(`${SELF_BASE}/busstops/${id}/upcoming`, {
         params: { amount: 3 },
         timeout: 12000,
@@ -105,8 +117,8 @@ async function runProbe({ now = new Date(), sampleSize = SAMPLE_SIZE } = {}) {
     }
     await sleep(THROTTLE_MS);
   }
-  logger.info(`probeEtaSamples: ${ok} paradas sondeadas (${err} errores) de ${picked.length} · ${h}h UY`);
-  return { ok: true, probed: ok, errors: err, sampled: picked.length };
+  logger.info(`probeEtaSamples: ${ok}/${ids.length} sondeadas (${err} err) · ${PROBE_STOPS ? "targeted" : "random"} · ${h}h UY`);
+  return { ok: true, probed: ok, errors: err, sampled: ids.length, mode: PROBE_STOPS ? "targeted" : "random" };
 }
 
-module.exports = { runProbe, uyHour, sampleK, SAMPLE_SIZE };
+module.exports = { runProbe, uyHour, sampleK, SAMPLE_SIZE, PROBE_STOPS };
