@@ -142,6 +142,7 @@ function buildRequestEvent({
     const lng = Array.isArray(coords) ? coords[0] : null;
     const lat = Array.isArray(coords) ? coords[1] : null;
     const tel = bus._etaTelemetry || {};
+    const vh = bus._vhist || null;
     return {
       busId: String(bus.busId || bus.id || bus.code || ""),
       // Canonical busUid (cross-empresa). Ver lib/bus-uid.js.
@@ -158,6 +159,12 @@ function buildRequestEvent({
       calibFactor: typeof tel.calibFactor === "number" ? tel.calibFactor : null,
       calibSource: tel.calibSource || null,
       trafficFactor: typeof tel.trafficFactor === "number" ? tel.trafficFactor : null,
+      // A/B v_hist (Smart ETA v2): estimación alternativa dist÷velocidad-histórica,
+      // logueada junto al etaFinalSec servido para comparar contra arribos reales.
+      etaVhistSec: vh && typeof vh.etaVhistSec === "number" ? vh.etaVhistSec : null,
+      distM: vh && typeof vh.distM === "number" ? vh.distM : null,
+      vhistSpeedKmh: vh && typeof vh.speedKmh === "number" ? vh.speedKmh : null,
+      vhistSource: vh ? vh.vhistSrc || null : null,
     };
   });
 

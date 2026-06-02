@@ -2751,6 +2751,19 @@ exports.api = onRequest({
       }
 
       if (processed.length > 0) {
+        // Coords de la parada para el v_hist (A/B): cliente si las mandó, sino del
+        // catálogo server-side. NO dispara Google (eso es aparte, gated por
+        // wantsTraffic). Sin coords → no se loguea v_hist, no rompe nada.
+        let fusionStopCoord = wantsTraffic ? { lat: stopLat, lng: stopLng } : null;
+        if (!fusionStopCoord) {
+          try {
+            await stopsCatalog.ensureLoaded(getToken);
+            const so = stopsCatalog.getStopById(id);
+            if (so && Number.isFinite(so.lat) && Number.isFinite(so.lng)) {
+              fusionStopCoord = { lat: so.lat, lng: so.lng };
+            }
+          } catch (e) { /* sin coords → sin log v_hist */ }
+        }
         try {
           processed = await etaFusion.fuseBuses({
             buses: processed,
@@ -2759,9 +2772,8 @@ exports.api = onRequest({
             admin,
             compareMode,
             clustersByLine,
-            // Coords de la parada para el fallback v_hist server-side (solo
-            // cuando el cliente las envía). Sin ellas, fuseBus omite el fallback.
-            stopCoord: wantsTraffic ? { lat: stopLat, lng: stopLng } : null,
+            // Coords de la parada (cliente o catálogo) para computar/loguear v_hist.
+            stopCoord: fusionStopCoord,
           });
           pipelineSource += "+fusion";
         } catch (fusionErr) {
