@@ -5680,7 +5680,8 @@ exports.probeEtaSamples = onSchedule(
   {
     schedule: "every 15 minutes",
     memory: "256MiB",
-    timeoutSeconds: 120,
+    // 200 paradas (top+bottom 100) secuenciales con throttle ~600ms ≈ 3 min/corrida.
+    timeoutSeconds: 300,
   },
   async () => {
     await etaProber.runProbe();
