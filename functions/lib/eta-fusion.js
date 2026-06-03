@@ -46,6 +46,12 @@ const speedHist = require("./eta-speed-hist");
  */
 const SERVER_SPEED_MODEL = process.env.ETA_SERVER_SPEED_MODEL === "true";
 
+// Servir v_hist como base PRIMARIA del ETA (no solo fallback). El A/B en producción
+// (apples-to-apples contra arribos reales) mostró que v_hist le gana a la eta IMM en
+// TODAS las bandas: cerca 60→84% ±1min, lejos 11→26%, MAE lejos 430→187s. Default OFF;
+// flipear con ETA_SERVE_VHIST=true (en .env.vamo-dbad6). Ver chevamo-docs/eta/.
+const SERVE_VHIST = process.env.ETA_SERVE_VHIST === "true";
+
 /** Haversine en metros (solo para el fallback v_hist; el path IMM ya conoce la ruta). */
 function haversineMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000;
@@ -143,6 +149,7 @@ function computeConfidence({ bus, etaSource, trafficApplied, calibSource }) {
   if (etaSource === "none") return 0;
   let conf = 0;
   if (etaSource === "imm") conf += 0.5;
+  else if (etaSource === "vhist") conf += 0.5; // base primaria validada por A/B
   else if (etaSource === "google") conf += 0.35;
 
   if (typeof bus.googleEtaSec === "number" && typeof bus.eta === "number") {
@@ -271,6 +278,14 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
     baseSource = "vhist";
   }
 
+  // Servir v_hist como PRIMARIA (flag ETA_SERVE_VHIST): reemplaza la base IMM por
+  // v_hist porque el A/B mostró que gana en todas las bandas. Conservamos etaRaw (IMM)
+  // y etaVhistSec logueados para seguir comparando. Si no hay vhist, queda la base IMM.
+  if (SERVE_VHIST && vhist) {
+    baseEtaSec = vhist.etaVhistSec;
+    baseSource = "vhist";
+  }
+
   if (baseEtaSec == null) {
     return {
       ...bus,
@@ -315,7 +330,12 @@ async function fuseBus({ bus, stopId, now, admin, compareMode = false, clustersB
 
   // Smart ETA: NO incluimos intermediateStops (requiere shape match que el
   // cliente tiene mejor) — el server aplica solo los multipliers globales.
-  const multiplier = hourMul * dayMul * weatherMul * trafficFactor * calibFactor;
+  // v_hist ya es velocidad histórica por línea×hora → NO le aplicamos los multipliers
+  // de contexto (sería doble conteo de la hora) ni la calibración (tuneada para la eta
+  // IMM). Solo el estabilizador suaviza el display. La base IMM sí lleva los multipliers.
+  const multiplier = baseSource === "vhist"
+    ? 1.0
+    : hourMul * dayMul * weatherMul * trafficFactor * calibFactor;
   let etaFinalSec = baseEtaSec * multiplier;
   etaFinalSec = Math.max(MIN_ETA_SEC, etaFinalSec);
 
